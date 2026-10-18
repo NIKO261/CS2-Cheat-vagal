@@ -1,5 +1,7 @@
 # vagal
 
+本项目为vibe coding产物
+
 Windows x64 CS2 内部 DLL。界面层使用项目自带的 `xdraw` / `xui` 渲染器（非 ImGui）。
 
 > 解决方案与工程文件仍沿用旧名 `firgune.slnx` / `firgune.vcxproj`，编译产物为 `vagal.dll` / `vagal-debug.dll`。
