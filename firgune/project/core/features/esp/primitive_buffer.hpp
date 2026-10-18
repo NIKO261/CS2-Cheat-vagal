@@ -67,20 +67,6 @@ namespace features::esp::detail {
 			return fixed_count + overflow_count;
 		}
 
-		[[nodiscard]] std::uintptr_t at( int index ) const noexcept
-		{
-			const auto total = this->count();
-			if ( index < 0 || total < 0 || index >= total ) {
-				return 0;
-			}
-
-			if ( index < fixed_count ) {
-				return fixed_data + static_cast<std::size_t>( index ) * primitive_size;
-			}
-
-			return overflow_data +
-				static_cast<std::size_t>( index - fixed_count ) * primitive_size;
-		}
 	};
 
 	static_assert( sizeof( primitive_output_buffer ) == 0x28 );
@@ -88,16 +74,76 @@ namespace features::esp::detail {
 	static_assert( offsetof( primitive_output_buffer, overflow_count ) == 0x10 );
 	static_assert( offsetof( primitive_output_buffer, overflow_data ) == 0x18 );
 
-	[[nodiscard]] inline std::optional<primitive_output_buffer> read_primitive_buffer(
+	// The model descriptor also appends meshlet primitives to a separate vector.
+	inline constexpr std::size_t meshlet_output_offset{ 0x8E8 };
+
+	struct meshlet_output_buffer
+	{
+		std::int32_t size{};
+		std::uint32_t reserved_04{};
+		std::uintptr_t data{};
+		std::int32_t capacity{};
+		std::uint32_t allocation_flags{};
+
+		[[nodiscard]] int count() const noexcept
+		{
+			return size < 0 || capacity < 0 || size > capacity ||
+				size > ( 1 << 20 ) || ( size && !data ) ? -1 : size;
+		}
+	};
+
+	static_assert( sizeof( meshlet_output_buffer ) == 0x18 );
+	static_assert( offsetof( meshlet_output_buffer, data ) == 0x8 );
+	static_assert( offsetof( meshlet_output_buffer, capacity ) == 0x10 );
+
+	struct primitive_buffer_snapshot
+	{
+		primitive_output_buffer regular{};
+		meshlet_output_buffer meshlets{};
+
+		template <typename Fn>
+		void for_each_added( const primitive_buffer_snapshot& before, Fn&& fn ) const
+		{
+			if ( regular.fixed_count < before.regular.fixed_count ||
+				regular.overflow_count < before.regular.overflow_count ||
+				meshlets.size < before.meshlets.size ) {
+				return;
+			}
+
+			// Compare each list separately and use AFTER pointers: native appends
+			// can reallocate either vector, and regular/meshlet output can mix.
+			for ( auto i = before.regular.fixed_count; i < regular.fixed_count; ++i ) {
+				fn( regular.fixed_data + static_cast<std::size_t>( i ) * primitive_size );
+			}
+			for ( auto i = before.regular.overflow_count; i < regular.overflow_count; ++i ) {
+				fn( regular.overflow_data + static_cast<std::size_t>( i ) * primitive_size );
+			}
+			for ( auto i = before.meshlets.size; i < meshlets.size; ++i ) {
+				fn( meshlets.data + static_cast<std::size_t>( i ) * primitive_size );
+			}
+		}
+	};
+
+	[[nodiscard]] inline std::optional<primitive_buffer_snapshot> read_primitive_buffer(
 		std::uintptr_t address )
 	{
 		if ( !address ) {
 			return std::nullopt;
 		}
 
-		const auto result = memory::safe_read<primitive_output_buffer>( address );
-		if ( !result || result->count() < 0 ) {
+		const auto regular = memory::safe_read<primitive_output_buffer>( address );
+		const auto meshlet_address = memory::safe_read<std::uintptr_t>( address + meshlet_output_offset );
+		if ( !regular || regular->count() < 0 || !meshlet_address ) {
 			return std::nullopt;
+		}
+
+		primitive_buffer_snapshot result{ *regular, {} };
+		if ( *meshlet_address ) {
+			const auto meshlets = memory::safe_read<meshlet_output_buffer>( *meshlet_address );
+			if ( !meshlets || meshlets->count() < 0 ) {
+				return std::nullopt;
+			}
+			result.meshlets = *meshlets;
 		}
 
 		return result;

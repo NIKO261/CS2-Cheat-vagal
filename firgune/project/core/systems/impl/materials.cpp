@@ -79,6 +79,7 @@ namespace systems {
 				F_RENDER_BACKFACES = 1
 				F_TRANSLUCENT = 1
 				F_DISABLE_Z_BUFFERING = 1
+				F_DISABLE_Z_PREPASS = 1
 
 				g_vColorTint = [1.0, 1.0, 1.0]
 				g_flModelTintAmount = 1.0
@@ -155,7 +156,11 @@ namespace systems {
 		static constexpr char matte_ignorez[ ] = R"#(<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d}
             format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->
             {
-                shader = "generic.vfx"
+                shader = "csgo_complex.vfx"
+
+                F_DISABLE_Z_BUFFERING = 1
+                F_DISABLE_Z_PREPASS = 1
+                F_TRANSLUCENT = 1
 
                 g_vColorTint = [1.0, 1.0, 1.0, 1.0]
 
@@ -187,6 +192,7 @@ namespace systems {
 
                 F_RENDER_BACKFACES = 0
                 F_DISABLE_Z_BUFFERING = 1
+                F_DISABLE_Z_PREPASS = 1
                 F_DISABLE_Z_WRITE = 1
                 F_PAINT_VERTEX_COLORS = 1
                 F_TRANSLUCENT = 1
@@ -254,6 +260,7 @@ namespace systems {
                 F_BLEND_MODE = 1
                 F_TRANSLUCENT = 1
                 F_DISABLE_Z_BUFFERING = 1
+                F_DISABLE_Z_PREPASS = 1
                 F_DISABLE_Z_WRITE = 1
 
                 g_vColorTint = [1.0, 1.0, 1.0, 0.0]
@@ -309,6 +316,7 @@ namespace systems {
                 F_TRANSLUCENT = 1
                 F_IGNOREZ = 1
                 F_DISABLE_Z_BUFFERING = 1
+                F_DISABLE_Z_PREPASS = 1
                 F_DISABLE_Z_WRITE = 1
                 F_RENDER_BACKFACES = 0
 
@@ -365,6 +373,7 @@ namespace systems {
 				F_RENDER_BACKFACES = 1
 				F_TRANSLUCENT = 1
 				F_DISABLE_Z_BUFFERING = 1
+				F_DISABLE_Z_PREPASS = 1
 
 				g_vColorTint = [0.0, 0.0, 0.0]
 				g_flModelTintAmount = 1.0
@@ -426,6 +435,7 @@ namespace systems {
 				F_TRANSLUCENT = 1
 				F_RENDER_BACKFACES = 1
 				F_DISABLE_Z_BUFFERING = 1
+				F_DISABLE_Z_PREPASS = 1
 				F_DISABLE_Z_WRITE = 1
 
 				g_vColorTint = [1.0, 1.0, 1.0, 1.0]

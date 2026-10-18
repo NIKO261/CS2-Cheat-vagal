@@ -244,12 +244,26 @@ namespace features::esp {
 				[[nodiscard]] bool valid( ) const { return this->entity && group_id != UINT32_MAX; }
 			};
 
+			struct inferno_patch
+			{
+				math::vector3 center{};
+				math::vector3 normal{};
+			};
+
+			struct inferno_surface
+			{
+				std::vector<math::vector3> points{};
+				std::vector<std::pair<math::vector3, math::vector3>> edges{};
+			};
+
 			struct inferno_state
 			{
-				std::array<float, 64 * 15> current_radii{};
-				std::vector<math::vector3> last_world_points{};
+				std::array<inferno_patch, 64> patches{};
+				std::vector<inferno_surface> surfaces{};
+				int patch_count{};
+				int begin_tick{};
+				std::int16_t entity_index{};
 				float fade_alpha{};
-				bool was_active{};
 				std::chrono::steady_clock::time_point spawn_time{};
 				math::vector3 last_avg_pos{};
 			};
@@ -280,13 +294,10 @@ namespace features::esp {
 			std::unordered_map<std::uintptr_t, smoke_state> m_smoke_states{};
 			std::unordered_map<std::uintptr_t, indicator_state> m_indicator_states{};
 
-			// add_inferno 复用缓冲：跨 inferno、跨帧保留容量，
-			// 消除每帧 12+ 次小 vector 堆分配。
-			std::vector<math::vector3> m_inferno_world_scratch{};
+			// World-space cells are rebuilt only when the replicated fire patches change.
+			std::vector<math::vector3> m_inferno_polygon_scratch{};
+			std::vector<math::vector3> m_inferno_clip_scratch{};
 			std::vector<math::vector2> m_inferno_points_scratch{};
-			std::vector<math::vector2> m_inferno_lower_scratch{};
-			std::vector<math::vector2> m_inferno_upper_scratch{};
-			std::vector<math::vector2> m_inferno_shrunk_scratch{};
 			// 烟区圆环与指示器弧线复用缓冲。
 			std::vector<math::vector2> m_smoke_points_scratch{};
 			std::vector<float> m_arc_scratch{};

@@ -349,6 +349,7 @@ namespace features::scripting {
 			if ( !g_current_cmd || lua_gettop( L ) < 2 ) return 0;
 			auto* base = g_current_cmd->csgo_user_cmd.mutable_base( );
 			if ( !base ) return 0;
+			features::movement::g_airstrafe.cancel_pending( );
 			base->set_forwardmove( static_cast< float >( luaL_checknumber( L, 1 ) ) );
 			base->set_leftmove( static_cast< float >( luaL_checknumber( L, 2 ) ) );
 			return 0;
@@ -369,6 +370,9 @@ namespace features::scripting {
 			if ( !g_current_cmd || lua_gettop( L ) < 2 ) return 0;
 			const auto button = static_cast< std::uintptr_t >( luaL_checkinteger( L, 1 ) );
 			const auto pressed = lua_toboolean( L, 2 ) != 0;
+			const auto movement_mask = cstypes::command_buttons::in_forward | cstypes::command_buttons::in_back
+				| cstypes::command_buttons::in_moveleft | cstypes::command_buttons::in_moveright;
+			if ( button & movement_mask ) features::movement::g_airstrafe.cancel_pending( );
 			if ( pressed )
 			{
 				g_current_cmd->buttons.value |= button;

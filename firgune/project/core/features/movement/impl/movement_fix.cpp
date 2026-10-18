@@ -278,69 +278,6 @@ namespace features::movement {
 			return a.x * b.y - a.y * b.x;
 		}
 
-		// Server BFEC40 accumulates yaw from the final command angle; BEF570
-		// uses each record's angle for the interval ENDING at that record.
-		// Keep the working strafe inputs and intervals, changing only their yaw
-		// origin. The implicit when=1 record resets to the command angle, so it
-		// needs an explicit source-angle endpoint as well (not just step zero).
-		[[nodiscard]] bool rebase_strafe_yaw(
-			proto::repeated_ptr_field<proto::subtick_move_step>* moves, float yaw_shift )
-		{
-			if ( !moves || !moves->m_rep || moves->size( ) <= 0 || moves->size( ) > k_max_subtick_moves )
-			{
-				return false;
-			}
-
-			const auto count = moves->size( );
-			auto sum_yaw{ 0.0f };
-			auto previous_when{ 0.0f };
-			for ( auto i = 0; i < count; ++i )
-			{
-				const auto step = moves->mutable_at( i );
-				if ( !step || !std::isfinite( step->when( ) ) || step->when( ) < previous_when
-					|| step->when( ) >= 1.0f || !std::isfinite( step->yaw_delta( ) ) )
-				{
-					return false;
-				}
-				previous_when = step->when( );
-				sum_yaw += step->yaw_delta( );
-			}
-
-			auto endpoint = moves->mutable_at( count - 1 );
-			if ( count == k_max_subtick_moves )
-			{
-				// The full-speed planner clamps its last records to the same 0.9
-				// time. Only reuse a trailing zero-duration, yaw-only record: its
-				// angle never moves the player, and the implicit endpoint discards it.
-				if ( endpoint->when( ) != moves->mutable_at( count - 2 )->when( )
-					|| endpoint->button( ) != 0 || endpoint->analog_forward_delta( ) != 0.0f
-					|| endpoint->analog_left_delta( ) != 0.0f || endpoint->pitch_delta( ) != 0.0f )
-				{
-					return false;
-				}
-				sum_yaw -= endpoint->yaw_delta( );
-			}
-			else
-			{
-				endpoint = systems::g_input.acquire_subtick_step( moves );
-				if ( !endpoint )
-				{
-					return false;
-				}
-			}
-
-			// No writes to the original trajectory until endpoint storage exists.
-			const auto first = moves->mutable_at( 0 );
-			first->set_yaw_delta( std::remainderf( first->yaw_delta( ) - yaw_shift, 360.0f ) );
-			first->m_cached_size = 0;
-			*endpoint = {};
-			endpoint->set_button( 0 );
-			endpoint->set_pressed( false );
-			endpoint->set_when( 1.0f );
-			endpoint->set_yaw_delta( std::remainderf( -sum_yaw, 360.0f ) );
-			return true;
-		}
-
 	} // namespace
 
 	void movement_fix::begin( systems::input::usercmd* cmd )
@@ -403,7 +340,7 @@ namespace features::movement {
 		auto moves = base->mutable_subtick_moves( );
 		const auto step_count = moves ? moves->size( ) : 0;
 
-		// 特征自行旋转移动基准的步骤（test strafer 以 yaw 增量扫掠）。
+		// 通用输入链的角度与模拟增量；统一空中轨迹在下方单独提交。
 		auto has_yaw_steps = false;
 		auto has_analog_steps = false;
 		for ( auto i = 0; i < step_count; ++i )
@@ -438,6 +375,15 @@ namespace features::movement {
 			return;
 		}
 
+		// The unified strafer emits its complete trajectory in the FINAL yaw
+		// basis. Do not quantize its wish again or fold away its yaw endpoints.
+		if ( g_airstrafe.finish( cmd ) )
+		{
+			base->m_cached_size = 0;
+			this->m_active = false;
+			return;
+		}
+
 		const auto previous_buttons = previous_movement_buttons( cmd );
 
 		if ( quantized )
@@ -460,16 +406,6 @@ namespace features::movement {
 			}
 
 			const auto intent = normalize_impulse( { base->forwardmove( ), base->leftmove( ) } );
-			// Auto-air-strafe already owns a working yaw trajectory. Rotating its
-			// digital inputs again (or time-sharing two directions) changes that
-			// trajectory and loses acceleration. Leave the AA-off path untouched.
-			if ( g_test_strafer.handled_this_tick( ) && has_yaw_steps
-				&& rebase_strafe_yaw( moves, yaw_shift ) )
-			{
-				base->m_cached_size = 0;
-				this->m_active = false;
-				return;
-			}
 
 			const auto reoriented = reframe_move( intent, this->m_source_yaw, target_yaw );
 			const auto reoriented_length = std::sqrtf( reoriented.x * reoriented.x + reoriented.y * reoriented.y );
@@ -489,15 +425,10 @@ namespace features::movement {
 				sync_movement_buttons( cmd, state, previous_buttons );
 			};
 
-			// 量化服消费侧只读 base f/l + 按钮时间线（IDA 五轮定案：模拟增量步
-			// 与 yaw 步的移动分量消费侧不读）。链上的纯模拟步（airstrafe 规划
-			// 链，最多写满 32 槽）对移动无效却吃光时间分割需要的锚点/切换步
-			// 槽位——移除腾槽；带 yaw 的步（test_strafer 同一步携带 yaw+模拟）
-			// 保留，yaw 驱动瞄准通道。旧分支在此对 base 做分数空间换算后原样
-			// 下发：SetupMove 逐项 roundf 把非 90° 倍数 AA 偏转的分量（±0.707、
-			// ±0.17…）吸到错误 8 向状态（135°→225° 反向、100°→归零不动），是
-			// 空中转向偏移/反向/不动的根因——改走下方时间分割，与地面同一
-			// 条已验证路径。
+			// 通用量化路径需要给数字状态切换腾出槽位：移除不携带 yaw
+			// 字段的纯模拟记录，保留其他写入者的角度记录。统一空中轨迹
+			// 已在上方单独提交，不会进入此分支。分数 base 输入会被逐轴
+			// roundf 吸到错误方向，因此这里继续使用原来的数字时间分割。
 			if ( has_analog_steps && moves && moves->m_rep )
 			{
 				auto elements = moves->m_rep->elements;

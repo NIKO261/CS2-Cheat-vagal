@@ -182,7 +182,6 @@
     <ClCompile Include="project\core\features\misc\impl\invalid_steam_logon.cpp" />
     <ClCompile Include="project\core\features\movement\impl\airstrafe.cpp" />
     <ClCompile Include="project\core\features\movement\impl\movement_fix.cpp" />
-    <ClCompile Include="project\core\features\movement\impl\test_strafer.cpp" />
     <ClCompile Include="project\core\features\movement\impl\bunnyhop.cpp" />
     <ClCompile Include="project\core\features\movement\impl\edgebug.cpp" />
     <ClCompile Include="project\core\features\movement\impl\edgejump.cpp" />

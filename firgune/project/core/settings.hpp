@@ -1515,24 +1515,22 @@ namespace settings {
 		xui::setting bhop{ true, {}, "bhop", "movement" };
 		xui::setting perfect_bunny_hop{ false, {}, "perfect bunny hop", "movement - bhop" };
 		xui::setting bhop_wasd_steering{ false, {}, "wasd steering", "movement - bhop" };
-		xui::setting airstrafe{ true, {}, "airstrafe", "movement" };
+		xui::setting airstrafe{ true, {}, "autostrafe", "movement" };
 		xui::setting airstrafe_fully_directional{ true, {}, "fully directional", "movement - airstrafe" };
 		xui::setting landing_assist{ false, {}, "jumpbug / edgebug", "movement" };
 		xui::setting fastladder{ true, {}, "fastladder", "movement" };
 		xui::setting edgejump{ false, { 'E', xui::bind_mode::hold_on}, "edgejump", "movement" };
 		xui::setting edgestop{ false, { 'N', xui::bind_mode::hold_on}, "edgestop", "movement" };
-		// Edge trials run first; jumpbug is the automatic fallback.
+		// Reference edge modes and duck cycles; Jumpbug fallback requires jump held.
+		config::val<int> edgebug_mode{ 1, "movement", "edgebug mode" };
+		config::val<bool> edgebug_include_jump_steps{ false, "movement", "edgebug jump steps" };
 		config::val<int> edgebug_passes{ 1, "movement", "edgebug passes" };
 		xui::setting slowwalk{ false, { 'P', xui::bind_mode::hold_on}, "slowwalk", "movement" };
 		config::val<float> slowwalk_speed{ 33.0f, "movement", "slowwalk speed" };
 		xui::setting fast_stop{ false, {}, "fast stop", "movement" };
 
-		struct test_strafer
-		{
-			xui::setting enabled{ false, {}, "test strafer", "movement" };
-			/// Steering duty cycle in percent — 100 keeps the original full-rate subtick sweep, lower steers a smaller share of each tick.
-			config::val<int> smoothness{ 100, "movement", "test strafer smoothness" };
-		} m_test_strafer{};
+		// Steering target blend only; acceleration always uses the whole tick.
+		config::val<int> autostrafe_smoothness{ 100, "movement", "autostrafe smoothness" };
 
 		struct velocity_debug
 		{

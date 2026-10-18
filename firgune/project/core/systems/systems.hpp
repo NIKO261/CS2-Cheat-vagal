@@ -280,6 +280,17 @@ namespace systems {
 
 		[[nodiscard]] const state& pre( ) const { return this->m_prestate; }
 		[[nodiscard]] bool is_simulating( ) const { return m_simulating; }
+		[[nodiscard]] bool landing_observation_ready( ) const { return this->m_landing_observation_ready.load( std::memory_order_acquire ); }
+		[[nodiscard]] bool landing_observed( ) const { return m_trial_landed; }
+		[[nodiscard]] bool landing_duck_held( ) const { return m_trial_duck_held; }
+		[[nodiscard]] bool is_simulating_pawn( std::uintptr_t pawn ) const { return m_simulating && pawn == m_trial_pawn; }
+		void observe_landing( std::uintptr_t pawn, bool duck_held )
+		{
+			if ( !this->is_simulating_pawn( pawn ) ) return;
+			m_trial_landed = true;
+			m_trial_duck_held |= duck_held;
+		}
+		void set_landing_observation_ready( bool ready ) { this->m_landing_observation_ready.store( ready, std::memory_order_release ); }
 		void set_animation_isolation_ready( bool ready )
 		{
 			this->m_animation_isolation_ready.store( ready, std::memory_order_release );
@@ -289,6 +300,10 @@ namespace systems {
 		state m_prestate{};
 		std::mutex m_simulation_mtx{};
 		inline static thread_local bool m_simulating{};
+		inline static thread_local std::uintptr_t m_trial_pawn{};
+		inline static thread_local bool m_trial_landed{};
+		inline static thread_local bool m_trial_duck_held{};
+		std::atomic_bool m_landing_observation_ready{};
 		std::atomic_bool m_animation_isolation_ready{};
 	};
 
@@ -310,6 +325,8 @@ namespace systems {
 		[[nodiscard]] bool projection_valid( const math::vector2& screen_pos ) { return screen_pos.x != this->k_invalid && screen_pos.y != this->k_invalid; }
 
 		[[nodiscard]] bool has_camera( ) const { return this->m_matrix_valid.load( std::memory_order_acquire ); }
+		// Read-only snapshot for clipping world-space overlay geometry.
+		[[nodiscard]] math::matrix4x4 matrix( ) const;
 		[[nodiscard]] math::vector3 origin( ) const { return this->m_origin; }
 		[[nodiscard]] math::vector3 angles( ) const { return this->m_angles; }
 		[[nodiscard]] float fov( ) const { return this->m_fov; }
@@ -319,8 +336,6 @@ namespace systems {
 
 		// 无锁双槽矩阵：写端（stage 12）写非活跃槽后原子换槽，
 		// 读端（渲染线程）按 acquire 序取槽拷贝，全程无互斥锁。
-		[[nodiscard]] math::matrix4x4 matrix( ) const;
-
 		std::array<math::matrix4x4, 2> m_matrix_slots{};
 		std::atomic<std::uint32_t> m_matrix_slot{ 0 };
 		std::atomic<bool> m_matrix_valid{};

@@ -16,12 +16,22 @@ namespace systems {
 		class simulation_scope
 		{
 		public:
-			explicit simulation_scope( bool& active ) : m_active{ active } { this->m_active = true; }
-			~simulation_scope( ) { this->m_active = false; }
+			explicit simulation_scope( bool& active, std::uintptr_t& pawn, bool& landed, bool& duck_held, std::uintptr_t trial_pawn )
+				: m_active{ active }, m_pawn{ pawn }, m_landed{ landed }, m_duck_held{ duck_held }
+			{
+				m_pawn = trial_pawn;
+				m_landed = false;
+				m_duck_held = false;
+				m_active = true;
+			}
+			~simulation_scope( ) { m_active = false; m_pawn = 0; m_landed = false; m_duck_held = false; }
 			simulation_scope( const simulation_scope& ) = delete;
 			simulation_scope& operator=( const simulation_scope& ) = delete;
 		private:
 			bool& m_active;
+			std::uintptr_t& m_pawn;
+			bool& m_landed;
+			bool& m_duck_held;
 		};
 
 		class state_guard
@@ -198,7 +208,7 @@ namespace systems {
 		}
 
 		// Destruction order restores pawn/movement bytes before releasing isolation.
-		detail::simulation_scope simulation_scope{ m_simulating };
+		detail::simulation_scope simulation_scope{ m_simulating, m_trial_pawn, m_trial_landed, m_trial_duck_held, local.pawn };
 		detail::state_guard guard;
 		guard.save_raw( movement_services + animation_begin,
 			static_cast<std::size_t>( animation_end - animation_begin ) );

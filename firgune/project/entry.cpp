@@ -341,6 +341,18 @@ namespace {
 		diag::step( "stage: coinit" );
 		const auto coinit_result =
 			CoInitializeEx( nullptr, COINIT_MULTITHREADED );
+		// COM belongs to this initialization thread, not the unloading thread.
+		struct com_scope
+		{
+			HRESULT result;
+			~com_scope( )
+			{
+				if ( SUCCEEDED( result ) )
+				{
+					CoUninitialize( );
+				}
+			}
+		} const com_cleanup{ coinit_result };
 		if ( FAILED( coinit_result ) )
 		{
 			diag::writef(
@@ -607,7 +619,6 @@ extern "C" int __stdcall entry( HMODULE module_handle, DWORD reason, LPVOID rese
 			return 1;
 		}
 
-#if defined( DEV )
 		if ( g_vectored_exception_handler )
 		{
 			RemoveVectoredExceptionHandler( g_vectored_exception_handler );
@@ -625,6 +636,9 @@ extern "C" int __stdcall entry( HMODULE module_handle, DWORD reason, LPVOID rese
 			SetUnhandledExceptionFilter( current_filter );
 		}
 
+		systems::events::shutdown( );
+
+#if defined( DEV )
 		g_terminate_process_hook.reset( );
 		g_minidump_hook.reset( );
 
@@ -637,10 +651,8 @@ extern "C" int __stdcall entry( HMODULE module_handle, DWORD reason, LPVOID rese
 		rendering::g_menu.shutdown( );
 
 		systems::g_account.shutdown( );
-		systems::events::shutdown( );
 		hooks::utility::shutdown( );
 		hooks::cheat::shutdown( );
-		CoUninitialize( );
 #else
 		// Manual unload in Release: still unhook, otherwise the game jumps
 		// into freed code on the next hooked call. Feature-owned scene

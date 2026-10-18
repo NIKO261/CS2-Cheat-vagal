@@ -44,6 +44,7 @@ namespace hooks {
 		static bool __fastcall render_crosshair( std::uintptr_t a1 );
 		static float __fastcall prepare_scene_material( std::uintptr_t material, void* a2, float a3 );
 		static void __fastcall update_animation_state( std::uintptr_t thisptr );
+		static void __fastcall pawn_on_land( std::uintptr_t pawn, float fall_speed );
 		static void __fastcall post_network_data_received( std::uintptr_t thisptr );
 		static bool __fastcall draw_overhead( std::uintptr_t pawn, std::uint32_t player_slot );
 		static std::uintptr_t __fastcall draw_legs( std::uintptr_t a1, std::uintptr_t a2, std::uintptr_t a3, std::uintptr_t a4, std::uintptr_t a5 );
@@ -93,6 +94,7 @@ namespace hooks {
 		inline static hooking::jmp m_render_crosshair{};
 		inline static hooking::jmp m_prepare_scene_material{};
 		inline static hooking::jmp m_update_animation_state{};
+		inline static hooking::jmp m_pawn_on_land{};
 		inline static hooking::jmp m_post_network_data_received{};
 		inline static hooking::jmp m_draw_overhead{};
 		inline static hooking::jmp m_draw_legs{};

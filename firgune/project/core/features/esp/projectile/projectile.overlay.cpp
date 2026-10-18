@@ -31,6 +31,70 @@ namespace features::esp::projectile {
 			return ico.texture ? &ico : nullptr;
 		}
 
+		// Approximate coverage per burning network patch, not an exact damage contour.
+		constexpr auto fire_radius{ 60.0f };
+		constexpr auto fire_segments{ 24 };
+		constexpr auto fire_plane_lift{ 1.5f };
+		constexpr auto fire_near_w{ 0.01f };
+
+		[[nodiscard]] static bool finite_fire_position( const math::vector3& p )
+		{
+			return std::isfinite( p.x ) && std::isfinite( p.y ) && std::isfinite( p.z )
+				&& std::fabsf( p.x ) < 1000000.0f && std::fabsf( p.y ) < 1000000.0f && std::fabsf( p.z ) < 1000000.0f;
+		}
+
+		[[nodiscard]] static bool same_fire_plane( const math::vector3& center, const math::vector3& normal,
+			const math::vector3& other_center, const math::vector3& other_normal )
+		{
+			const auto delta = other_center - center;
+			return normal.x * other_normal.x + normal.y * other_normal.y + normal.z * other_normal.z > 0.98f
+				&& std::fabsf( delta.x * normal.x + delta.y * normal.y + delta.z * normal.z ) < 4.0f;
+		}
+
+		// Sutherland-Hodgman half-plane clipping. All coordinates here are local XY.
+		static void clip_fire_cell( std::vector<math::vector3>& polygon, std::vector<math::vector3>& scratch,
+			const math::vector3& delta, float limit )
+		{
+			scratch.clear( );
+			if ( polygon.empty( ) ) return;
+			auto a = polygon.back( );
+			auto da = a.x * delta.x + a.y * delta.y - limit;
+			for ( const auto& b : polygon )
+			{
+				const auto db = b.x * delta.x + b.y * delta.y - limit;
+				if ( ( da <= 0.0f ) != ( db <= 0.0f ) )
+				{
+					scratch.push_back( a + ( b - a ) * ( da / ( da - db ) ) );
+				}
+				if ( db <= 0.0f ) scratch.push_back( b );
+				a = b;
+				da = db;
+			}
+			polygon.swap( scratch );
+		}
+
+		[[nodiscard]] static bool clip_fire_edge( math::vector3& a, math::vector3& b,
+			const math::vector3& delta, float limit )
+		{
+			const auto da = a.x * delta.x + a.y * delta.y - limit;
+			const auto db = b.x * delta.x + b.y * delta.y - limit;
+			if ( da > 0.0f && db > 0.0f ) return false;
+			if ( ( da <= 0.0f ) != ( db <= 0.0f ) )
+			{
+				const auto intersection = a + ( b - a ) * ( da / ( da - db ) );
+				if ( da > 0.0f ) a = intersection;
+				else b = intersection;
+			}
+			return true;
+		}
+
+		[[nodiscard]] static math::vector3 fire_plane_point( const math::vector3& offset,
+			const math::vector3& center, const math::vector3& normal )
+		{
+			return { center.x + offset.x, center.y + offset.y,
+				center.z - ( normal.x * offset.x + normal.y * offset.y ) / normal.z + fire_plane_lift };
+		}
+
 		constexpr auto edge_padding{ 52.0f };
 		constexpr auto icon_radius{ 18.0f };
 		constexpr auto arc_radius{ 22.0f };
@@ -129,6 +193,12 @@ namespace features::esp::projectile {
 		std::erase_if( this->m_smoke_states, [ & ]( const auto& entry )
 			{
 				return !live_smokes_contains( entry.first );
+			} );
+
+		std::erase_if( this->m_inferno_states, [ & ]( const auto& entry )
+			{
+				return !overlay_cfg.is_active( 5 ) || std::ranges::none_of( *snapshot, [ & ]( const auto& cached )
+					{ return cached.ptr == entry.first && cached.schema_hash == "C_Inferno"_hash; } );
 			} );
 
 		this->add_landing_indicators( middle_draw_list );
@@ -476,224 +546,183 @@ namespace features::esp::projectile {
 
 	void overlay::add_inferno( xdraw::draw_list& draw_list, xdraw::draw_list& middle_draw_list, const systems::entities::cached& entity, const settings::esp::projectile::overlay::infernos& cfg )
 	{
-		constexpr auto num_directions{ 15 };
-		constexpr auto two_pi{ std::numbers::pi_v<float> *2.0f };
-		constexpr auto lerp_speed{ 6.0f };
+		const auto count_offset = SCHEMA( "C_Inferno", "m_fireCount"_hash );
+		const auto positions_offset = SCHEMA( "C_Inferno", "m_firePositions"_hash );
+		const auto burning_offset = SCHEMA( "C_Inferno", "m_bFireIsBurning"_hash );
+		const auto normals_offset = SCHEMA( "C_Inferno", "m_BurnNormal"_hash );
+		const auto post_offset = SCHEMA( "C_Inferno", "m_bInPostEffectTime"_hash );
+		const auto tick_offset = SCHEMA( "C_Inferno", "m_nFireEffectTickBegin"_hash );
+		if ( !count_offset || !positions_offset || !burning_offset || !post_offset || !tick_offset ) return;
 
-		// 方向表：15 个方向只依赖循环变量，编译期数量固定，
-		// 首次使用时计算一次，热循环内查表替代每点重复 cosf/sinf。
-		static const auto k_directions = [ ]( )
-			{
-				std::array<std::pair<float, float>, num_directions> directions{};
-				for ( auto d = 0; d < num_directions; ++d )
-				{
-					const auto angle = two_pi * static_cast< float >( d ) / static_cast< float >( num_directions );
-					directions[ d ] = { std::cosf( angle ), std::sinf( angle ) };
-				}
-
-				return directions;
-			}( );
-
-		const auto delta_time = xdraw::delta_time( );
-		const auto drawable_count = memory::read<int>( entity.ptr + 0x8570 );
-		auto& state = this->m_inferno_states[ entity.ptr ];
-
-		const auto count = std::min( std::max( drawable_count, 0 ), 64 );
-		const auto lerp_t = std::fminf( lerp_speed * delta_time, 1.0f );
-
-		auto& world_points = this->m_inferno_world_scratch;
-		world_points.clear( );
-		math::vector3 avg_pos{};
-		auto active_count{ 0 };
-		auto any_active{ false };
-
-		for ( auto i = 0; i < count; ++i )
+		// Read the network arrays, never the version-dependent private drawable layout.
+		const auto raw_count = memory::safe_read<int>( entity.ptr + count_offset );
+		const auto positions = memory::safe_read<std::array<math::vector3, 64>>( entity.ptr + positions_offset );
+		const auto burning = memory::safe_read<std::array<bool, 64>>( entity.ptr + burning_offset );
+		const auto begin_tick = memory::safe_read<int>( entity.ptr + tick_offset );
+		const auto post_effect = memory::safe_read<bool>( entity.ptr + post_offset );
+		if ( !raw_count || !positions || !burning || !begin_tick || !post_effect || *post_effect )
 		{
-			if ( !memory::read<bool>( entity.ptr + SCHEMA( "C_Inferno", "m_bFireIsBurning"_hash ) + i ) )
-			{
-				continue;
-			}
-
-			const auto base = entity.ptr + 0x1970 + static_cast< std::size_t >( i ) * 432u;
-			const auto position = memory::read<math::vector3>( base );
-			const auto current_radius = memory::read<float>( base + 0x1a8 );
-			const auto target_radius = memory::read<float>( base + 0x1ac );
-
-			if ( current_radius < 1.0f )
-			{
-				continue;
-			}
-
-			any_active = true;
-			avg_pos = avg_pos + position;
-			++active_count;
-
-			const auto extent = std::fmaxf( 60.0f, current_radius );
-
-			for ( auto d = 0; d < num_directions; ++d )
-			{
-				const auto idx = i * num_directions + d;
-				const auto dx = k_directions[ d ].first;
-				const auto dy = k_directions[ d ].second;
-
-				const auto trace_frac = memory::read<float>( base + 0x38 + d * sizeof( float ) );
-				const auto target = std::fminf( trace_frac * target_radius, extent );
-
-				state.current_radii[ idx ] += ( target - state.current_radii[ idx ] ) * lerp_t;
-
-				world_points.push_back( position + math::vector3{ dx * state.current_radii[ idx ], dy * state.current_radii[ idx ], 0.0f } );
-			}
-		}
-
-		if ( any_active )
-		{
-			state.fade_alpha = std::fminf( state.fade_alpha + detail::fade_speed * delta_time, 1.0f );
-			state.was_active = true;
-			state.last_world_points = world_points;
-
-			if ( state.spawn_time == std::chrono::steady_clock::time_point{} )
-			{
-				state.spawn_time = std::chrono::steady_clock::now( );
-			}
-		}
-		else if ( state.was_active )
-		{
-			state.fade_alpha -= detail::fade_speed * delta_time;
-
-			if ( state.fade_alpha <= 0.0f )
-			{
-				this->m_inferno_states.erase( entity.ptr );
-				return;
-			}
-
-			world_points = state.last_world_points;
-		}
-		else
-		{
+			this->m_inferno_states.erase( entity.ptr );
 			return;
 		}
-
-		auto& points = this->m_inferno_points_scratch;
-		points.clear( );
-
-		for ( const auto& wp : world_points )
+		const auto normals = normals_offset
+			? memory::safe_read<std::array<math::vector3, 64>>( entity.ptr + normals_offset ) : std::nullopt;
+		const auto count = std::clamp( *raw_count, 0, 64 );
+		auto& state = this->m_inferno_states[ entity.ptr ];
+		if ( state.begin_tick != *begin_tick || state.entity_index != entity.index )
 		{
-			const auto projected = systems::g_view.project( wp );
+			state = {};
+			state.begin_tick = *begin_tick;
+			state.entity_index = entity.index;
+		}
 
-			if ( systems::g_view.projection_valid( projected ) )
+		auto changed{ false };
+		auto active_count{ 0 };
+		math::vector3 avg_pos{};
+		for ( auto i = 0; i < count; ++i )
+		{
+			if ( !( *burning )[ i ] || !detail::finite_fire_position( ( *positions )[ i ] ) ) continue;
+			auto normal = normals ? ( *normals )[ i ] : math::vector3{ 0.0f, 0.0f, 1.0f };
+			const auto normal_length = normal.length( );
+			if ( !detail::finite_fire_position( normal ) || !std::isfinite( normal_length ) || normal_length < 0.1f
+				|| normal.z / normal_length < 0.2f ) normal = { 0.0f, 0.0f, 1.0f };
+			else normal = normal * ( 1.0f / normal_length );
+			const auto& center = ( *positions )[ i ];
+			auto& patch = state.patches[ active_count ];
+			changed = changed || ( patch.center - center ).length_sqr( ) > 0.0f || ( patch.normal - normal ).length_sqr( ) > 0.0f;
+			patch = { center, normal };
+			avg_pos = avg_pos + center;
+			++active_count;
+		}
+		if ( active_count == 0 )
+		{
+			this->m_inferno_states.erase( entity.ptr );
+			return;
+		}
+		changed = changed || state.patch_count != active_count;
+		state.patch_count = active_count;
+		state.last_avg_pos = avg_pos * ( 1.0f / static_cast<float>( active_count ) );
+		const auto delta_time = std::max( xdraw::delta_time( ), 0.0f );
+		state.fade_alpha = std::min( state.fade_alpha + detail::fade_speed * delta_time, 1.0f );
+		if ( state.spawn_time == std::chrono::steady_clock::time_point{} ) state.spawn_time = std::chrono::steady_clock::now( );
+
+		if ( changed )
+		{
+			static const auto directions = [ ]( )
+				{
+					std::array<math::vector3, detail::fire_segments> result{};
+					for ( auto d = 0; d < detail::fire_segments; ++d )
+					{
+						const auto angle = 2.0f * std::numbers::pi_v<float> * static_cast<float>( d ) / detail::fire_segments;
+						result[ d ] = { std::cosf( angle ) * detail::fire_radius, std::sinf( angle ) * detail::fire_radius, 0.0f };
+					}
+					return result;
+				}( );
+			state.surfaces.resize( active_count );
+			auto& polygon = this->m_inferno_polygon_scratch;
+			auto& scratch = this->m_inferno_clip_scratch;
+			for ( auto i = 0; i < active_count; ++i )
 			{
-				points.push_back( projected );
+				auto& surface = state.surfaces[ i ];
+				surface.points.clear( );
+				surface.edges.clear( );
+				const auto& patch = state.patches[ i ];
+				struct half_plane { math::vector3 delta; float limit; };
+				std::array<half_plane, 64> planes{};
+				auto plane_count{ 0 };
+				polygon.assign( directions.begin( ), directions.end( ) );
+				for ( auto j = 0; j < active_count && !polygon.empty( ); ++j )
+				{
+					if ( i == j ) continue;
+					const auto& other = state.patches[ j ];
+					if ( !detail::same_fire_plane( patch.center, patch.normal, other.center, other.normal ) ) continue;
+					const auto delta = other.center - patch.center;
+					const auto distance_sq = delta.x * delta.x + delta.y * delta.y;
+					if ( distance_sq >= 4.0f * detail::fire_radius * detail::fire_radius ) continue;
+					if ( distance_sq < 0.0001f )
+					{
+						if ( j < i ) polygon.clear( ); // Coincident patches have one owner.
+						continue;
+					}
+					planes[ plane_count++ ] = { delta, distance_sq * 0.5f };
+					detail::clip_fire_cell( polygon, scratch, delta, distance_sq * 0.5f );
+				}
+				if ( polygon.size( ) < 3 ) continue;
+				for ( const auto& point : polygon ) surface.points.push_back( detail::fire_plane_point( point, patch.center, patch.normal ) );
+				// Only exposed circle edges get an outline; internal cell seams stay invisible.
+				for ( auto d = 0; d < detail::fire_segments; ++d )
+				{
+					auto a = directions[ d ];
+					auto b = directions[ ( d + 1 ) % detail::fire_segments ];
+					auto visible{ true };
+					for ( auto p = 0; p < plane_count && visible; ++p )
+						visible = detail::clip_fire_edge( a, b, planes[ p ].delta, planes[ p ].limit );
+					if ( visible ) surface.edges.emplace_back( detail::fire_plane_point( a, patch.center, patch.normal ), detail::fire_plane_point( b, patch.center, patch.normal ) );
+				}
 			}
 		}
 
-		if ( points.size( ) >= 3 )
+		if ( !systems::g_view.has_camera( ) ) return;
+		const auto matrix = systems::g_view.matrix( );
+		const auto [width, height] = xdraw::viewport_size( );
+		const auto depth = [ & ]( const math::vector3& p )
+			{ return matrix[ 3 ][ 0 ] * p.x + matrix[ 3 ][ 1 ] * p.y + matrix[ 3 ][ 2 ] * p.z + matrix[ 3 ][ 3 ]; };
+		const auto project = [ & ]( const math::vector3& p ) -> math::vector2
+			{
+				const auto w = std::max( depth( p ), detail::fire_near_w );
+				return { width * 0.5f * ( 1.0f + ( matrix[ 0 ][ 0 ] * p.x + matrix[ 0 ][ 1 ] * p.y + matrix[ 0 ][ 2 ] * p.z + matrix[ 0 ][ 3 ] ) / w ),
+					height * 0.5f * ( 1.0f - ( matrix[ 1 ][ 0 ] * p.x + matrix[ 1 ][ 1 ] * p.y + matrix[ 1 ][ 2 ] * p.z + matrix[ 1 ][ 3 ] ) / w ) };
+			};
+		const auto& fill = cfg.fill_color.value;
+		const auto& outline = cfg.outline_color.value;
+		const xdraw::color fill_color{ fill.r, fill.g, fill.b, static_cast<std::uint8_t>( fill.a * state.fade_alpha ) };
+		const xdraw::color outline_color{ outline.r, outline.g, outline.b, static_cast<std::uint8_t>( outline.a * state.fade_alpha ) };
+		const auto glow_strength = std::clamp( cfg.glow_strength.value, 0.0f, 1.0f );
+		for ( const auto& surface : state.surfaces )
 		{
-			std::ranges::sort( points, [ ]( const math::vector2& a, const math::vector2& b ) { return a.x < b.x || ( a.x == b.x && a.y < b.y ); } );
-
-			auto& lower = this->m_inferno_lower_scratch;
-			auto& upper = this->m_inferno_upper_scratch;
-			lower.clear( );
-			upper.clear( );
-
-			for ( const auto& p : points )
+			if ( surface.points.empty( ) ) continue;
+			// Clip before projection, including patches crossing the camera.
+			auto& clipped = this->m_inferno_clip_scratch;
+			clipped.clear( );
+			auto a = surface.points.back( );
+			auto da = depth( a ) - detail::fire_near_w;
+			for ( const auto& b : surface.points )
 			{
-				while ( lower.size( ) >= 2 )
-				{
-					const auto& p1 = lower[ lower.size( ) - 2 ];
-					const auto& p2 = lower[ lower.size( ) - 1 ];
-
-					if ( ( p2.x - p1.x ) * ( p.y - p1.y ) - ( p2.y - p1.y ) * ( p.x - p1.x ) > 0.0f )
-					{
-						break;
-					}
-
-					lower.pop_back( );
-				}
-
-				lower.push_back( p );
+				const auto db = depth( b ) - detail::fire_near_w;
+				if ( ( da >= 0.0f ) != ( db >= 0.0f ) ) clipped.push_back( a + ( b - a ) * ( da / ( da - db ) ) );
+				if ( db >= 0.0f ) clipped.push_back( b );
+				a = b;
+				da = db;
 			}
-
-			for ( auto it = points.rbegin( ); it != points.rend( ); ++it )
+			auto& points = this->m_inferno_points_scratch;
+			points.clear( );
+			for ( const auto& point : clipped ) points.push_back( project( point ) );
+			const auto span = std::span<const float>( reinterpret_cast<const float*>( points.data( ) ), points.size( ) * 2 );
+			// No AA fringe on shared edges: adjacent cells must not darken or leave seams.
+			draw_list.convex_filled( span, fill_color, false );
+			if ( cfg.glow.value )
 			{
-				while ( upper.size( ) >= 2 )
-				{
-					const auto& p1 = upper[ upper.size( ) - 2 ];
-					const auto& p2 = upper[ upper.size( ) - 1 ];
-
-					if ( ( p2.x - p1.x ) * ( it->y - p1.y ) - ( p2.y - p1.y ) * ( it->x - p1.x ) > 0.0f )
-					{
-						break;
-					}
-
-					upper.pop_back( );
-				}
-
-				upper.push_back( *it );
+				const xdraw::color glow_fill{ fill.r, fill.g, fill.b, static_cast<std::uint8_t>( fill_color.a * glow_strength ) };
+				xdraw::get_glow( ).convex_filled( span, glow_fill, false );
 			}
-
-			lower.pop_back( );
-			upper.pop_back( );
-			lower.insert( lower.end( ), upper.begin( ), upper.end( ) );
-
-			if ( lower.size( ) >= 3 )
+			for ( auto [edge_a, edge_b] : surface.edges )
 			{
-				auto hx{ 0.0f };
-				auto hy{ 0.0f };
-
-				for ( const auto& p : lower )
+				const auto wa = depth( edge_a ) - detail::fire_near_w;
+				const auto wb = depth( edge_b ) - detail::fire_near_w;
+				if ( wa < 0.0f && wb < 0.0f ) continue;
+				if ( ( wa >= 0.0f ) != ( wb >= 0.0f ) )
 				{
-					hx += p.x;
-					hy += p.y;
+					const auto intersection = edge_a + ( edge_b - edge_a ) * ( wa / ( wa - wb ) );
+					if ( wa < 0.0f ) edge_a = intersection;
+					else edge_b = intersection;
 				}
-
-				hx /= static_cast< float >( lower.size( ) );
-				hy /= static_cast< float >( lower.size( ) );
-
-				const auto alpha_scale = state.fade_alpha;
-				const auto& outline_col = cfg.outline_color.value;
-				const auto outline_a = static_cast< std::uint8_t >( static_cast< float >( outline_col.a ) * alpha_scale );
-				const auto hull_span = std::span<const float>( reinterpret_cast< const float* >( lower.data( ) ), lower.size( ) * 2 );
-
-				const auto& fill_col = cfg.fill_color.value;
-				const auto fill_a = static_cast<std::uint8_t>( static_cast<float>( fill_col.a ) * alpha_scale );
-				draw_list.convex_filled( hull_span, { fill_col.r, fill_col.g, fill_col.b, fill_a } );
-				draw_list.polyline( hull_span, xdraw::color{ outline_col.r, outline_col.g, outline_col.b, outline_a }, true, cfg.outline_thickness );
-
+				const auto screen_a = project( edge_a );
+				const auto screen_b = project( edge_b );
+				draw_list.line( screen_a.x, screen_a.y, screen_b.x, screen_b.y, outline_color, cfg.outline_thickness.value );
 				if ( cfg.glow.value )
 				{
-					auto& glow = xdraw::get_glow( );
-					const auto ga = static_cast< std::uint8_t >( static_cast< float >( outline_col.a ) * cfg.glow_strength * alpha_scale );
-					const auto glow_col = xdraw::color{ outline_col.r, outline_col.g, outline_col.b, ga };
-
-					const auto fa = static_cast< std::uint8_t >( static_cast< float >( fill_col.a ) * cfg.glow_strength * alpha_scale );
-
-					constexpr auto ring_count{ 8 };
-
-					auto& shrunk = this->m_inferno_shrunk_scratch;
-
-					for ( auto r = 0; r < ring_count; ++r )
-					{
-						const auto t = static_cast< float >( r ) / static_cast< float >( ring_count );
-						const auto alpha = static_cast< std::uint8_t >( static_cast< float >( fa ) * ( 1.0f - t ) );
-
-						if ( alpha == 0 )
-						{
-							continue;
-						}
-
-						shrunk.resize( lower.size( ) );
-
-						for ( auto i = 0u; i < lower.size( ); ++i )
-						{
-							shrunk[ i ].x = lower[ i ].x + ( hx - lower[ i ].x ) * t;
-							shrunk[ i ].y = lower[ i ].y + ( hy - lower[ i ].y ) * t;
-						}
-
-						const auto span = std::span<const float>( reinterpret_cast< const float* >( shrunk.data( ) ), shrunk.size( ) * 2 );
-						glow.convex_filled( span, xdraw::color{ fill_col.r, fill_col.g, fill_col.b, alpha } );
-					}
-
-					glow.polyline( hull_span, glow_col, true, cfg.outline_thickness + 2.0f );
+					const xdraw::color glow_color{ outline.r, outline.g, outline.b, static_cast<std::uint8_t>( outline_color.a * glow_strength ) };
+					xdraw::get_glow( ).line( screen_a.x, screen_a.y, screen_b.x, screen_b.y, glow_color, cfg.outline_thickness.value + 2.0f );
 				}
 			}
 		}
@@ -701,18 +730,15 @@ namespace features::esp::projectile {
 		const auto& ind_cfg = settings::g_esp.m_projectile.m_overlay.m_indicator.get_group( 2 );
 		if ( ind_cfg.enabled.value )
 		{
-			if ( active_count > 0 )
-			{
-				state.last_avg_pos = avg_pos * ( 1.0f / static_cast< float >( active_count ) );
-			}
-
 			if ( state.last_avg_pos.length_sqr( ) > 0.0f )
 			{
 				const auto indicator_pos = state.last_avg_pos;
-				const auto fire_lifetime = memory::read<float>( entity.ptr + SCHEMA( "C_Inferno", "m_nFireLifetime"_hash ) );
+				const auto lifetime_offset = SCHEMA( "C_Inferno", "m_nFireLifetime"_hash );
+				const auto fire_lifetime = lifetime_offset ? memory::safe_read<float>( entity.ptr + lifetime_offset ).value_or( 0.0f ) : 0.0f;
 				const auto elapsed = std::chrono::duration<float>( std::chrono::steady_clock::now( ) - state.spawn_time ).count( );
 				const auto remaining = std::max( 0.0f, fire_lifetime - elapsed );
-				const auto frac = std::clamp( remaining / fire_lifetime, 0.0f, 1.0f );
+				const auto frac = std::isfinite( fire_lifetime ) && fire_lifetime > 0.0f
+					? std::clamp( remaining / fire_lifetime, 0.0f, 1.0f ) : 0.0f;
 
 				const auto target_proj = systems::g_view.project_full( indicator_pos );
 				const auto anchor_proj = systems::g_view.project_full( indicator_pos + math::vector3{ 0.0f, 0.0f, detail::anchor_world_offset_z } );

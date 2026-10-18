@@ -800,6 +800,42 @@ namespace config {
 		if ( selected ) serial::json_to_field( *selected, *target->second );
 	}
 
+	// New explicit fields win, including off. Legacy test strafer owned the
+	// old pipeline when both were enabled, so preserve its binding first.
+	inline void migrate_autostrafe( const nlohmann::json& fields,
+		const std::unordered_map<std::uint32_t, field*>& lookup, bool legacy_air_default )
+	{
+		const auto find_value = [ & ]( std::string_view name ) -> const nlohmann::json*
+		{
+			char text[ 12 ];
+			std::snprintf( text, sizeof( text ), "%08x", detail::make_key( "movement", name ) );
+			const auto it = fields.find( text );
+			return it != fields.end( ) ? &*it : nullptr;
+		};
+		const auto valid = []( const nlohmann::json* value )
+		{
+			return value && value->is_object( ) && value->contains( "v" ) && ( *value )[ "v" ].is_boolean( );
+		};
+		const auto target = lookup.find( detail::make_key( "movement", "autostrafe" ) );
+		if ( target != lookup.end( ) && !find_value( "autostrafe" ) )
+		{
+			const auto air = find_value( "airstrafe" );
+			const auto test = find_value( "test strafer" );
+			if ( valid( air ) || valid( test ) )
+			{
+				const auto fallback = nlohmann::json{ { "v", legacy_air_default } };
+				const auto old_air = valid( air ) ? air : &fallback;
+				const auto selected = valid( test ) && ( *test )[ "v" ].get<bool>( ) ? test
+					: ( *old_air )[ "v" ].get<bool>( ) ? old_air : valid( air ) ? air : test;
+				serial::json_to_field( *selected, *target->second );
+			}
+		}
+		const auto smooth = lookup.find( detail::make_key( "movement", "autostrafe smoothness" ) );
+		const auto old_smooth = find_value( "test strafer smoothness" );
+		if ( smooth != lookup.end( ) && !find_value( "autostrafe smoothness" ) && old_smooth )
+			serial::json_to_field( *old_smooth, *smooth->second );
+	}
+
 	inline bool from_json( const nlohmann::json& root )
 	{
 		if ( !root.contains( "version" ) || !root.contains( "fields" ) )
@@ -834,6 +870,7 @@ namespace config {
 			serial::json_to_field( it.value( ), *found->second );
 		}
 		migrate_landing_assist( fields_obj, lookup );
+		migrate_autostrafe( fields_obj, lookup, true );
 		return true;
 	}
 
@@ -911,6 +948,7 @@ namespace config {
 			serial::json_to_field( it.value( ), *found->second );
 		}
 		migrate_landing_assist( fields_obj, lookup );
+		migrate_autostrafe( fields_obj, lookup, delta_ver < k_delta_blank_baseline_version );
 
 		return true;
 	}

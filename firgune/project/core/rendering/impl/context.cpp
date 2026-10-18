@@ -87,6 +87,15 @@ namespace rendering {
 			}
 		}
 
+		if ( !this->m_rtv )
+		{
+			this->create_rtv( swap_chain );
+			if ( !this->m_rtv )
+			{
+				return;
+			}
+		}
+
 		this->try_bind_ui_assets( );
 		const auto full_runtime_ready =
 			g_startup_progress.is_runtime_ready( ) && g_menu.is_startup_finished( );
@@ -132,6 +141,11 @@ namespace rendering {
 
 	void context::on_resize_buffers( )
 	{
+		if ( this->m_context )
+		{
+			this->m_context->OMSetRenderTargets( 0, nullptr, nullptr );
+		}
+
 		if ( this->m_rtv )
 		{
 			this->m_rtv->Release( );
@@ -141,11 +155,19 @@ namespace rendering {
 
 	void context::on_resize_buffers_post( IDXGISwapChain* swap_chain )
 	{
-		this->create_rtv( swap_chain );
+		if ( this->m_initialized )
+		{
+			this->create_rtv( swap_chain );
+		}
 	}
 
 	void context::create_rtv( IDXGISwapChain* swap_chain )
 	{
+		if ( !swap_chain || !this->m_device || !this->m_context || this->m_rtv )
+		{
+			return;
+		}
+
 		ID3D11Texture2D* back_buffer{ nullptr };
 		if ( SUCCEEDED( swap_chain->GetBuffer( 0, __uuidof( ID3D11Texture2D ), reinterpret_cast< void** >( &back_buffer ) ) ) )
 		{

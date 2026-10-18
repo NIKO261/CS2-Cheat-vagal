@@ -20,13 +20,48 @@ namespace features::combat {
 		}
 	}
 
-	float rage::evaluate_hitchance( const scan_hit& hit, const aim_context& ctx, float inaccuracy, int samples ) const
+	float rage::required_hitchance( const settings::combat::ragebot::weapon_group& config ) const
 	{
-		if ( !hit.record || !hit.record->valid || hit.bone_index < 0 || hit.bone_index >= hit.record->bone_count ) return 0.0f;
-		return g_shared.calculate_hitchance( hit.source_eye.position, hit.aim_angle, hit.hitbox,
-			hit.record->bones[ hit.bone_index ], inaccuracy, ctx.spread, samples );
+		return config.hitchance_override.value
+			? static_cast< float >( config.hitchance_override_value ) / 100.0f
+			: static_cast< float >( config.hitchance ) / 100.0f;
 	}
 
+	void rage::advance_hitchance( const scan_hit& hit, const aim_context& ctx, float inaccuracy, shared::hitchance_result& result, int target_samples ) const
+	{
+		if ( !hit.record || !hit.record->valid || hit.bone_index < 0 || hit.bone_index >= hit.record->bone_count )
+		{
+			result.planned = std::max( result.planned, target_samples );
+			result.evaluated = std::max( result.evaluated, target_samples );
+			result.hits = 0;
+			result.complete = result.evaluated >= result.planned;
+			return;
+		}
+		g_shared.advance_hitchance( hit.source_eye.position, hit.aim_angle, hit.hitbox,
+			hit.record->bones[ hit.bone_index ], inaccuracy, ctx.spread, result, target_samples );
+	}
+
+	// True only when the point can no longer reach the threshold AND cannot
+	// overtake the incumbent even if every remaining sample were a hit.
+	bool rage::cannot_precede( const scan_hit& hit, const shared::hitchance_result& chance, const target& incumbent, int required_percent ) const
+	{
+		if ( !incumbent.valid ) return false;
+		if ( chance.can_reach( required_percent ) ) return false;
+		// A definite failure never precedes a passing incumbent (the first key).
+		if ( incumbent.passes_hitchance ) return true;
+
+		target upper{};
+		upper.hit = hit;
+		upper.hitchance = chance.upper_bound( );
+		upper.expected_damage = hit.damage * upper.hitchance;
+		upper.passes_hitchance = false;
+		upper.valid = true;
+		return !this->target_precedes( upper, incumbent );
+	}
+
+	// Single final ordering for normal and precision modes:
+	// threshold -> lethal -> hitbox priority -> expected damage -> no wall ->
+	// center -> newer history -> smaller FOV -> stable target/record/eye/point id.
 	bool rage::target_precedes( const target& lhs, const target& rhs ) const
 	{
 		if ( !rhs.valid ) return lhs.valid;
@@ -36,27 +71,7 @@ namespace features::combat {
 			if ( left == right ) return 0;
 			return left > right ? 1 : -1;
 		};
-		if ( const auto v = compare( lhs.passes_hitchance, rhs.passes_hitchance ) )
-		{
-			// 期望伤害豁免：未过门槛的更高优先级命中（典型是小 hitbox 的头，
-			// 残余精度下 hitchance 差几个百分点）只要期望伤害不低于已过门槛
-			// 的低优先级命中，就按优先级取——大 hitbox 的 hitchance 优势不该
-			// 抢走期望伤害更高的头。门槛本身仍是硬闸：没有任何过门槛候选时
-			// 不会放行纯低 hitchance 的射击。
-			const auto lhs_priority = hitbox_priority( lhs.hit.hitbox_index );
-			const auto rhs_priority = hitbox_priority( rhs.hit.hitbox_index );
-			if ( lhs_priority != rhs_priority )
-			{
-				const auto higher_is_lhs = lhs_priority < rhs_priority;
-				const auto& higher = higher_is_lhs ? lhs : rhs;
-				const auto& lower = higher_is_lhs ? rhs : lhs;
-				if ( higher.expected_damage >= lower.expected_damage )
-				{
-					return higher_is_lhs;
-				}
-			}
-			return v > 0;
-		}
+		if ( const auto v = compare( lhs.passes_hitchance, rhs.passes_hitchance ) ) return v > 0;
 		if ( const auto v = compare( lhs.is_lethal( ), rhs.is_lethal( ) ) ) return v > 0;
 		if ( const auto v = compare( -hitbox_priority( lhs.hit.hitbox_index ), -hitbox_priority( rhs.hit.hitbox_index ) ) ) return v > 0;
 		if ( const auto v = compare( lhs.expected_damage, rhs.expected_damage ) ) return v > 0;
@@ -66,142 +81,138 @@ namespace features::combat {
 		const auto rhs_tick = rhs.hit.record ? rhs.hit.record->tick : std::numeric_limits<int>::min( );
 		if ( const auto v = compare( lhs_tick, rhs_tick ) ) return v > 0;
 		if ( const auto v = compare( -lhs.hit.fov, -rhs.hit.fov ) ) return v > 0;
-		if ( const auto v = compare( -static_cast<std::int64_t>( lhs.hit.candidate_ordinal ), -static_cast<std::int64_t>( rhs.hit.candidate_ordinal ) ) ) return v > 0;
+		if ( lhs.hit.candidate_ordinal != rhs.hit.candidate_ordinal ) return lhs.hit.candidate_ordinal < rhs.hit.candidate_ordinal;
+		if ( lhs.hit.record_ordinal != rhs.hit.record_ordinal ) return lhs.hit.record_ordinal < rhs.hit.record_ordinal;
+		if ( lhs.hit.source_eye_index != rhs.hit.source_eye_index ) return lhs.hit.source_eye_index < rhs.hit.source_eye_index;
+		if ( lhs.hit.point_ordinal != rhs.hit.point_ordinal ) return lhs.hit.point_ordinal < rhs.hit.point_ordinal;
 		return lhs.hit.hitbox_index < rhs.hit.hitbox_index;
 	}
 
-	rage::target rage::select_best( const aim_context& ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy ) const
+	rage::target rage::select_best( const aim_context& ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy, rage_stats* stats ) const
 	{
 		const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-		const auto required = config.hitchance_override.value
-			? static_cast<float>( config.hitchance_override_value ) / 100.0f
-			: static_cast<float>( config.hitchance ) / 100.0f;
-		const auto precision = settings::g_combat.m_ragebot.precision.value && !config.no_spread.value;
-		if ( precision )
+		const auto required_percent = static_cast<int>( config.hitchance_override.value ? config.hitchance_override_value : config.hitchance );
+		const auto no_spread = config.no_spread.value;
+		const auto precision = settings::g_combat.m_ragebot.precision.value && !no_spread;
+		const auto performance = settings::g_combat.m_ragebot.precision_mode.value
+			== settings::combat::ragebot::precision_mode::performance;
+		// Final verification budget per mode. The coarse pass below only orders the
+		// work; it never decides the winner.
+		const auto full_samples = precision ? ( performance ? 1024 : 512 ) : 512;
+		const auto coarse_samples = performance ? 256 : 128;
+
+		struct ranked_hit
 		{
-			// First rank every viable point with a small deterministic sample.
-			// Only the first likely winner pays for the full verification in the
-			// common case; failed estimates fall through to the next point, so a
-			// coarse false negative cannot hide a genuinely valid shot.
-			const auto performance = settings::g_combat.m_ragebot.precision_mode.value
-				== settings::combat::ragebot::precision_mode::performance;
-			const auto coarse_samples = performance ? 256 : 128;
-			const auto full_samples = performance ? 1024 : 512;
-			struct ranked_hit
-			{
-				const scan_hit* hit{};
-				float hitchance{};
-				float expected_damage{};
-				bool passes{};
-			};
+			const scan_hit* hit{};
+			shared::hitchance_result chance{};
+		};
 
-			std::vector<ranked_hit> ranked{};
-			ranked.reserve( hits.size( ) );
-			for ( const auto& hit : hits )
-			{
-				if ( !hit.record || !hit.record->valid || hit.damage <= 0.0f ) continue;
-				const auto hc = std::clamp( this->evaluate_hitchance( hit, ctx, eval_inaccuracy, coarse_samples ), 0.0f, 1.0f );
-				ranked.push_back( { &hit, hc, hit.damage * std::max( hc, 0.01f ), hc >= required } );
-			}
-
-			const auto compare = [ ]( auto left, auto right )
-			{
-				if ( left == right ) return 0;
-				return left > right ? 1 : -1;
-			};
-			std::stable_sort( ranked.begin( ), ranked.end( ), [ & ]( const ranked_hit& lhs, const ranked_hit& rhs )
-				{
-					if ( const auto v = compare( lhs.passes, rhs.passes ) ) return v > 0;
-					const auto lhs_lethal = lhs.hit->damage >= static_cast<float>( lhs.hit->health );
-					const auto rhs_lethal = rhs.hit->damage >= static_cast<float>( rhs.hit->health );
-					if ( const auto v = compare( lhs_lethal, rhs_lethal ) ) return v > 0;
-					if ( const auto v = compare( -hitbox_priority( lhs.hit->hitbox_index ), -hitbox_priority( rhs.hit->hitbox_index ) ) ) return v > 0;
-					if ( const auto v = compare( lhs.expected_damage, rhs.expected_damage ) ) return v > 0;
-					if ( const auto v = compare( !lhs.hit->penetrated, !rhs.hit->penetrated ) ) return v > 0;
-					if ( const auto v = compare( lhs.hit->is_center, rhs.hit->is_center ) ) return v > 0;
-					const auto lhs_tick = lhs.hit->record ? lhs.hit->record->tick : std::numeric_limits<int>::min( );
-					const auto rhs_tick = rhs.hit->record ? rhs.hit->record->tick : std::numeric_limits<int>::min( );
-					if ( const auto v = compare( lhs_tick, rhs_tick ) ) return v > 0;
-					if ( const auto v = compare( -lhs.hit->fov, -rhs.hit->fov ) ) return v > 0;
-					if ( lhs.hit->candidate_ordinal != rhs.hit->candidate_ordinal ) return lhs.hit->candidate_ordinal < rhs.hit->candidate_ordinal;
-					return lhs.hit->hitbox_index < rhs.hit->hitbox_index;
-				} );
-
-			target fallback{};
-			for ( const auto& entry : ranked )
-			{
-				const auto hc = std::clamp( this->evaluate_hitchance( *entry.hit, ctx, eval_inaccuracy, full_samples ), 0.0f, 1.0f );
-				target current{};
-				current.hit = *entry.hit;
-				current.hitchance = hc;
-				current.expected_damage = entry.hit->damage * std::max( hc, 0.01f );
-				current.passes_hitchance = hc >= required;
-				current.valid = true;
-
-				// The full-sample threshold is authoritative. Precision mode has
-				// no expected-damage exemption and never promotes a failed point.
-				if ( current.passes_hitchance ) return current;
-				if ( !fallback.valid || current.hitchance > fallback.hitchance ||
-					( current.hitchance == fallback.hitchance && current.expected_damage > fallback.expected_damage ) )
-				{
-					fallback = current;
-				}
-			}
-			return fallback;
-		}
-
-		target best{};
-		// 过门槛最优：comparator-exact 剪枝的锚点。豁免仲裁只会让更高
-		// 优先级的命中翻盘，因此"更差优先级 / 同优先级更低伤害"的剪枝
-		// 锚到它依然精确，512 采样 hitchance 的性能护栏不变。
-		target best_pass{};
-		// 低帧率护栏：候选多时减半蒙特卡洛采样（256 样本 ±3% 噪声，
-		// 门槛容差内），避免"扫描越重帧越低、帧越低扫描越晚"的螺旋。
-		const auto hc_samples = hits.size( ) > 12 ? 256 : 512;
+		std::vector<ranked_hit> ranked{};
+		ranked.reserve( hits.size( ) );
 		for ( const auto& hit : hits )
 		{
 			if ( !hit.record || !hit.record->valid || hit.damage <= 0.0f ) continue;
+			ranked.push_back( { &hit, {} } );
+		}
+		if ( ranked.empty( ) ) return {};
 
-			// Comparator-exact prune: evaluate_hitchance runs a 512-sample
-			// spread simulation per hit on the main thread, which dominates
-			// the tick with many players and multipoints on. Once the
-			// incumbent passes hitchance, is lethal and sits at a higher
-			// hitbox priority, no later hit can precede it (both are
-			// comparator keys that do not depend on hitchance); at equal
-			// priority a hit with strictly lower raw damage loses the
-			// expected-damage key even at a perfect hitchance, since
-			// expected_damage = damage * clamp(hc) <= damage.
-			if ( best_pass.valid && best_pass.passes_hitchance && best_pass.is_lethal( )
-				&& ( hitbox_priority( hit.hitbox_index ) > hitbox_priority( best_pass.hit.hitbox_index )
-					|| ( hitbox_priority( hit.hitbox_index ) == hitbox_priority( best_pass.hit.hitbox_index )
-						&& hit.damage < best_pass.expected_damage ) ) )
+		const auto materialize = [ & ]( const ranked_hit& entry )
+		{
+			target out{};
+			out.hit = *entry.hit;
+			out.hitchance = no_spread ? 1.0f : std::clamp( entry.chance.value( ), 0.0f, 1.0f );
+			// 实际伤害 × 实际命中率；零命中率不会被抬成正值。
+			out.expected_damage = entry.hit->damage * out.hitchance;
+			out.passes_hitchance = no_spread || entry.chance.reaches( required_percent );
+			out.reason = no_spread ? fire_reason::no_spread
+				: ( out.passes_hitchance ? fire_reason::hitchance : fire_reason::none );
+			out.valid = true;
+			return out;
+		};
+
+		if ( no_spread )
+		{
+			// NoSpread keeps its existing path: fire_gun derives the angle and the
+			// spread cone is not sampled for selection.
+			target best{};
+			for ( const auto& entry : ranked )
+			{
+				const auto current = materialize( entry );
+				if ( !best.valid || this->target_precedes( current, best ) ) best = current;
+			}
+			return best;
+		}
+
+		// Coarse pass: order the full verification by the same comparator using
+		// the partial estimate. It cannot promote or reject a point by itself.
+		if ( precision )
+		{
+			for ( auto& entry : ranked )
+			{
+				const auto before = entry.chance.evaluated;
+				this->advance_hitchance( *entry.hit, ctx, eval_inaccuracy, entry.chance, coarse_samples );
+				if ( stats )
+				{
+					++stats->work( ).hitchance_points;
+					stats->work( ).hitchance_samples += entry.chance.evaluated - before;
+				}
+			}
+			std::vector<target> estimates{};
+			estimates.reserve( ranked.size( ) );
+			for ( const auto& entry : ranked ) estimates.push_back( materialize( entry ) );
+			std::vector<std::size_t> order( ranked.size( ) );
+			std::iota( order.begin( ), order.end( ), std::size_t{} );
+			std::stable_sort( order.begin( ), order.end( ), [ & ]( std::size_t lhs, std::size_t rhs )
+				{
+					return this->target_precedes( estimates[ lhs ], estimates[ rhs ] );
+				} );
+			std::vector<ranked_hit> sorted{};
+			sorted.reserve( ranked.size( ) );
+			for ( const auto index : order ) sorted.push_back( std::move( ranked[ index ] ) );
+			ranked = std::move( sorted );
+		}
+
+		const auto begin_ns = k_rage_diagnostics ? steady_now_ns( ) : 0;
+		constexpr auto advance_chunk{ 128 };
+		target best{};
+		for ( auto& entry : ranked )
+		{
+			// Cheap comparator-exact pre-check: a passing, lethal incumbent with a
+			// higher hitbox priority (or the same priority and more raw damage than
+			// the incumbent's expected damage) cannot be overtaken by this hit.
+			if ( best.valid && best.passes_hitchance && best.is_lethal( )
+				&& ( hitbox_priority( entry.hit->hitbox_index ) > hitbox_priority( best.hit.hitbox_index )
+					|| ( hitbox_priority( entry.hit->hitbox_index ) == hitbox_priority( best.hit.hitbox_index )
+						&& entry.hit->damage < best.expected_damage ) ) )
 			{
 				continue;
 			}
 
-			const auto hc = config.no_spread.value ? 1.0f : this->evaluate_hitchance( hit, ctx, eval_inaccuracy, hc_samples );
-			target current{};
-			current.hit = hit;
-			current.hitchance = std::clamp( hc, 0.0f, 1.0f );
-			current.expected_damage = hit.damage * std::max( current.hitchance, 0.01f );
-			current.passes_hitchance = config.no_spread.value || current.hitchance >= required;
-			current.valid = true;
-			if ( current.passes_hitchance && ( !best_pass.valid || this->target_precedes( current, best_pass ) ) )
+			// Fix the plan at the mode's full budget first; each step only appends
+			// the missing suffix, so a coarse result is reused instead of redone.
+			if ( stats && !precision ) ++stats->work( ).hitchance_points;
+			entry.chance.planned = full_samples;
+			entry.chance.complete = entry.chance.evaluated >= full_samples;
+			while ( !entry.chance.complete )
 			{
-				best_pass = current;
+				const auto before = entry.chance.evaluated;
+				const auto target_samples = std::min( before + advance_chunk, full_samples );
+				this->advance_hitchance( *entry.hit, ctx, eval_inaccuracy, entry.chance, target_samples );
+				if ( stats ) stats->work( ).hitchance_samples += entry.chance.evaluated - before;
+				if ( entry.chance.complete ) break;
+				if ( this->cannot_precede( *entry.hit, entry.chance, best, required_percent ) ) break;
 			}
+
+			// Points stopped by a proof are skipped; the winner always has the
+			// mode's complete verification.
+			if ( !entry.chance.complete ) continue;
+			const auto current = materialize( entry );
 			if ( !best.valid || this->target_precedes( current, best ) ) best = current;
 		}
-
-		// 物化豁免仲裁：最终 best 未过门槛但按完整 comparator 赢过了过门槛
-		// 候选（期望伤害豁免 / 致命优先），视为可开火——否则 decide_stop 的
-		// accurate 门禁会把仲裁结果再拦回去，选择等于白选。
-		if ( best.valid && !best.passes_hitchance && best_pass.valid
-			&& this->target_precedes( best, best_pass ) )
+		if constexpr ( k_rage_diagnostics )
 		{
-			best.passes_hitchance = true;
+			if ( stats ) stats->time( ).hitchance_ns += steady_now_ns( ) - begin_ns;
 		}
 		return best;
 	}
-
 }

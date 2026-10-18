@@ -8,6 +8,248 @@
 // AA_FIRE_DIAGNOSTICS_END
 
 namespace features::combat {
+	namespace {
+		// Diagnostics are aggregated into bounded histograms; no per-command
+		// history is kept and disabled builds compile the whole path out.
+		constexpr auto k_stats_report_interval{ 128 };
+		constexpr auto k_stats_detail_interval{ 31 };
+		constexpr auto k_stats_histogram_buckets{ 64 };
+		constexpr auto k_stats_phase_count{ 6 };
+		constexpr auto k_stats_reason_count{ 12 };
+
+		struct stats_aggregate
+		{
+			unsigned commands{};
+			unsigned reasons[ k_stats_reason_count ]{};
+			unsigned submitted{};
+			unsigned advanced{};
+			unsigned fired[ 5 ]{};
+			unsigned brake_repredictions{};
+			unsigned rescans{};
+			rage_stats::counters work{};
+			unsigned long long sums[ k_stats_phase_count ]{};
+			unsigned histogram[ k_stats_phase_count ][ k_stats_histogram_buckets ]{};
+			int last_command{ -1 };
+			std::uint32_t last_mode{};
+			std::uint32_t last_config{};
+		};
+
+		[[nodiscard]] stats_aggregate& aggregate_state( )
+		{
+			static stats_aggregate instance{};
+			return instance;
+		}
+
+		[[nodiscard]] int histogram_bucket( std::uint64_t value ) noexcept
+		{
+			auto bucket = 0;
+			while ( value > 1 && bucket + 1 < k_stats_histogram_buckets )
+			{
+				value >>= 1;
+				++bucket;
+			}
+			return bucket;
+		}
+
+		[[nodiscard]] double histogram_percentile( const unsigned* buckets, unsigned count, double percentile )
+		{
+			if ( count == 0 ) return 0.0;
+			const auto target = std::max( 1u, static_cast< unsigned >( std::ceil( static_cast< double >( count ) * percentile ) ) );
+			unsigned seen{};
+			for ( auto i = 0; i < k_stats_histogram_buckets; ++i )
+			{
+				seen += buckets[ i ];
+				if ( seen >= target )
+				{
+					const auto bits = std::min( i + 1, 62 );
+					return static_cast< double >( 1ull << bits ) / 1000.0;
+				}
+			}
+			return 0.0;
+		}
+
+		void report_stats( const stats_aggregate& aggregate )
+		{
+			const auto phase = [ & ]( int index, double percentile )
+			{
+				return histogram_percentile( aggregate.histogram[ index ], aggregate.commands, percentile );
+			};
+			diag::writef( diag::level::info,
+				"[rage-stats:v1] cmds=%u cmd=%d mode=%x cfg=%08x "
+				"total_us=%.1f/%.1f/%.1f pred=%.1f/%.1f/%.1f prep=%.1f/%.1f/%.1f "
+				"scan=%.1f/%.1f/%.1f hc=%.1f/%.1f/%.1f sel=%.1f/%.1f/%.1f "
+				"enemies=%d records=%d eyes=%d points=%d pen=%d hcpoints=%d hcsamples=%d "
+				"brake=%d rescan=%d submitted=%u advanced=%u fired=hc:%u,force:%u,dt:%u,ns:%u "
+				"reasons=disabled:%u,no_candidates:%u,no_hits:%u,no_best:%u,cooldown:%u,pred_failed:%u,"
+				"not_settled:%u,low_hc:%u,visual:%u,scope:%u,submit_failed:%u",
+				aggregate.commands, aggregate.last_command, aggregate.last_mode, aggregate.last_config,
+				phase( 5, 0.5 ), phase( 5, 0.95 ), phase( 5, 0.99 ),
+				phase( 0, 0.5 ), phase( 0, 0.95 ), phase( 0, 0.99 ),
+				phase( 1, 0.5 ), phase( 1, 0.95 ), phase( 1, 0.99 ),
+				phase( 2, 0.5 ), phase( 2, 0.95 ), phase( 2, 0.99 ),
+				phase( 3, 0.5 ), phase( 3, 0.95 ), phase( 3, 0.99 ),
+				phase( 4, 0.5 ), phase( 4, 0.95 ), phase( 4, 0.99 ),
+				aggregate.work.enemies, aggregate.work.records, aggregate.work.eyes, aggregate.work.points,
+				aggregate.work.penetration_calls, aggregate.work.hitchance_points, aggregate.work.hitchance_samples,
+				static_cast<int>( aggregate.brake_repredictions ), static_cast<int>( aggregate.rescans ), aggregate.submitted, aggregate.advanced,
+				aggregate.fired[ 1 ], aggregate.fired[ 2 ], aggregate.fired[ 3 ], aggregate.fired[ 4 ],
+				aggregate.reasons[ 1 ], aggregate.reasons[ 2 ], aggregate.reasons[ 3 ], aggregate.reasons[ 4 ],
+				aggregate.reasons[ 5 ], aggregate.reasons[ 6 ], aggregate.reasons[ 7 ], aggregate.reasons[ 8 ],
+				aggregate.reasons[ 9 ], aggregate.reasons[ 10 ], aggregate.reasons[ 11 ] );
+		}
+
+		[[nodiscard]] std::uint32_t weapon_config_hash( const settings::combat::ragebot::weapon_group& config )
+		{
+			auto hash = 2166136261u;
+			const auto mix = [ & ]( std::uint32_t value ) { hash = ( hash ^ value ) * 16777619u; };
+			mix( static_cast< std::uint32_t >( config.hitchance.value ) );
+			mix( config.hitchance_override.value ? 1u : 0u );
+			mix( static_cast< std::uint32_t >( config.hitchance_override_value ) );
+			mix( static_cast< std::uint32_t >( config.min_damage ) );
+			mix( config.min_damage_override.value ? 1u : 0u );
+			mix( static_cast< std::uint32_t >( config.min_damage_override_value ) );
+			mix( static_cast< std::uint32_t >( config.pointscale.value * 100.0f ) );
+			mix( static_cast< std::uint32_t >( config.max_fov.value ) );
+			mix( config.no_spread.value ? 1u : 0u );
+			mix( config.body_aim.value ? 1u : 0u );
+			mix( config.force_shot.value ? 1u : 0u );
+			mix( config.force_shot_air.value ? 1u : 0u );
+			mix( config.dynamic_pointscale.value ? 1u : 0u );
+			for ( auto i = 0; i < 6; ++i )
+			{
+				mix( config.hitboxes.values[ static_cast<std::size_t>( i ) ] ? 1u : 0u );
+				mix( config.multipoints.values[ static_cast<std::size_t>( i ) ] ? 1u : 0u );
+			}
+			return hash;
+		}
+
+		[[nodiscard]] std::uint32_t diagnostic_mode( const settings::combat::ragebot::weapon_group& config )
+		{
+			const auto& weapon = g_shared.ctx( );
+			auto mode = static_cast< std::uint32_t >( weapon.weapon_type ) & 0x1fu;
+			if ( settings::g_combat.m_ragebot.precision.value ) mode |= 0x100u;
+			if ( settings::g_combat.m_ragebot.precision_mode.value == settings::combat::ragebot::precision_mode::performance ) mode |= 0x200u;
+			if ( config.no_spread.value ) mode |= 0x400u;
+			if ( config.force_shot.value ) mode |= 0x800u;
+			if ( config.force_shot_air.value ) mode |= 0x1000u;
+			if ( weapon.is_scoped ) mode |= 0x2000u;
+			if ( g_rage.dt( ).can_pair( ) ) mode |= 0x4000u;
+			return mode;
+		}
+	}
+
+	void rage_stats::begin( int command_number )
+	{
+		this->m_command = command_number;
+		this->m_mode = 0;
+		this->m_config_hash = 0;
+		this->m_work = {};
+		this->m_time = {};
+		this->m_brake_repredictions = 0;
+		this->m_rescans = 0;
+		this->m_reason = no_fire_reason::none;
+		this->m_fire_reason = fire_reason::none;
+		this->m_submitted = false;
+		if constexpr ( k_rage_diagnostics ) this->m_start_ns = steady_now_ns( );
+	}
+
+	void rage_stats::add( const counters& other ) noexcept
+	{
+		this->m_work.enemies += other.enemies;
+		this->m_work.records += other.records;
+		this->m_work.eyes += other.eyes;
+		this->m_work.points += other.points;
+		this->m_work.penetration_calls += other.penetration_calls;
+		this->m_work.hitchance_points += other.hitchance_points;
+		this->m_work.hitchance_samples += other.hitchance_samples;
+	}
+
+	void rage_stats::submit( fire_reason reason )
+	{
+		this->m_submitted = true;
+		this->m_fire_reason = reason;
+		this->m_reason = no_fire_reason::none;
+	}
+
+	void rage_stats::finish( )
+	{
+		if constexpr ( !k_rage_diagnostics ) return;
+
+		// Submission and actual weapon discharge are separate facts: the second
+		// one is only observed when the live weapon claims or consumes the shot.
+		struct pending_shot
+		{
+			bool valid{};
+			int command{ -1 };
+			std::uintptr_t weapon{};
+			int next_attack_tick{};
+			int clip{};
+		};
+		static pending_shot pending{};
+		const auto& weapon = g_shared.ctx( );
+		auto& aggregate = aggregate_state( );
+		if ( pending.valid )
+		{
+			const auto advanced = weapon.valid && weapon.weapon == pending.weapon &&
+				( weapon.clip < pending.clip || weapon.next_primary_attack_tick > pending.next_attack_tick );
+			if ( advanced ) ++aggregate.advanced;
+			pending.valid = false;
+		}
+		if ( this->m_submitted )
+		{
+			++aggregate.submitted;
+			++aggregate.fired[ static_cast<std::size_t>( this->m_fire_reason ) ];
+			pending = { true, this->m_command, weapon.weapon, weapon.next_primary_attack_tick, weapon.clip };
+		}
+		if ( this->m_command < 0 ) return;
+
+		this->m_time.total_ns = steady_now_ns( ) - this->m_start_ns;
+		++aggregate.commands;
+		const auto reason_index = static_cast< std::size_t >( this->m_reason );
+		if ( reason_index < k_stats_reason_count ) ++aggregate.reasons[ reason_index ];
+		aggregate.brake_repredictions += static_cast<unsigned>( this->m_brake_repredictions );
+		aggregate.rescans += static_cast<unsigned>( this->m_rescans );
+		aggregate.work.enemies += this->m_work.enemies;
+		aggregate.work.records += this->m_work.records;
+		aggregate.work.eyes += this->m_work.eyes;
+		aggregate.work.points += this->m_work.points;
+		aggregate.work.penetration_calls += this->m_work.penetration_calls;
+		aggregate.work.hitchance_points += this->m_work.hitchance_points;
+		aggregate.work.hitchance_samples += this->m_work.hitchance_samples;
+
+		const std::uint64_t* phases[ k_stats_phase_count ]{
+			&this->m_time.prediction_ns, &this->m_time.prepare_ns, &this->m_time.scan_ns,
+			&this->m_time.hitchance_ns, &this->m_time.select_ns, &this->m_time.total_ns };
+		for ( auto i = 0; i < k_stats_phase_count; ++i )
+		{
+			aggregate.sums[ i ] += *phases[ i ];
+			++aggregate.histogram[ i ][ histogram_bucket( *phases[ i ] ) ];
+		}
+		aggregate.last_command = this->m_command;
+		aggregate.last_mode = this->m_mode;
+		aggregate.last_config = this->m_config_hash;
+
+		if ( aggregate.commands % k_stats_report_interval == 0 )
+		{
+			report_stats( aggregate );
+		}
+		if ( this->m_command % k_stats_detail_interval == 0 )
+		{
+			diag::writef( diag::level::info,
+				"[rage-stats-cmd:v1] cmd=%d mode=%x cfg=%08x reason=%u eyes=%d points=%d pen=%d hcpoints=%d hcsamples=%d "
+				"brake=%d rescan=%d submitted=%d fire=%u pred_us=%.1f prep_us=%.1f scan_us=%.1f hc_us=%.1f sel_us=%.1f total_us=%.1f",
+				this->m_command, this->m_mode, this->m_config_hash, static_cast<unsigned>( this->m_reason ),
+				this->m_work.eyes, this->m_work.points, this->m_work.penetration_calls,
+				this->m_work.hitchance_points, this->m_work.hitchance_samples,
+				this->m_brake_repredictions, this->m_rescans, static_cast< int >( this->m_submitted ), static_cast<unsigned>( this->m_fire_reason ),
+				static_cast< double >( this->m_time.prediction_ns ) / 1000.0,
+				static_cast< double >( this->m_time.prepare_ns ) / 1000.0,
+				static_cast< double >( this->m_time.scan_ns ) / 1000.0,
+				static_cast< double >( this->m_time.hitchance_ns ) / 1000.0,
+				static_cast< double >( this->m_time.select_ns ) / 1000.0,
+				static_cast< double >( this->m_time.total_ns ) / 1000.0 );
+		}
+	}
 
 	bool rage::is_physically_settled( const aim_context& ctx ) const
 	{
@@ -44,34 +286,21 @@ namespace features::combat {
 		return ctx.velocity.length_2d( ) <= ctx.accurate_threshold;
 	}
 
-	bool rage::weapon_ready_to_fire( ) const
+	bool rage::weapon_ready_to_fire( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const
 	{
-		const auto& weapon = g_shared.ctx( );
-		if ( !weapon.valid || weapon.in_reload || weapon.clip <= 0 ) return false;
-		const auto controller = systems::g_local.get( ).controller;
-		if ( !controller ) return false;
-		const auto tick_base = memory::read<int>( controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
-		return tick_base >= weapon.next_primary_attack_tick;
+		// Use the same command clock and committed DT exception as submission.
+		// TickBase alone can lag the client tick and postpone the brake.
+		return cmd && local.controller && g_shared.ctx( ).valid &&
+			g_shared.can_shoot( cmd, local.controller, !this->m_double_tap.bypass_cooldown( ) );
 	}
 
-	bool rage::should_brake_early( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
-	{
-		const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-		if ( !config.autostop.value || !config.autostop_early.value || !ctx.on_ground ) return false;
-		if ( !this->weapon_ready_to_fire( ) ) return false;
-		if ( ( GetAsyncKeyState( VK_SPACE ) & 0x8000 ) != 0 ) return false;
-		return this->hittable_after_brake( ctx, local, candidates );
-	}
-
-	rage::stop_decision rage::decide_stop( systems::input::usercmd* cmd, const aim_context& ctx, const target& best,
+	rage::stop_decision rage::decide_stop( systems::input::usercmd* cmd, const aim_context& ctx, const scan_config& scan, const target& best,
 		std::vector<candidate>& candidates, const systems::local::snapshot& local,
 		bool allow_fire, bool landing_pending ) const
 	{
 		stop_decision result{};
 		const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-		const auto required = config.hitchance_override.value
-			? static_cast<float>( config.hitchance_override_value ) / 100.0f
-			: static_cast<float>( config.hitchance ) / 100.0f;
+		const auto required = this->required_hitchance( config );
 		const auto precision = settings::g_combat.m_ragebot.precision.value && !config.no_spread.value;
 		// Double tap fires a tight pair: a hitchance sitting a few percent
 		// under the threshold would otherwise stall the alternating beat
@@ -86,16 +315,11 @@ namespace features::combat {
 		// brake already cancelled the slide, and the stop-mode gate below
 		// would keep grinding the brake past the settle point.
 		const auto speed = ctx.velocity.length_2d( );
-		const auto physically_settled = this->is_physically_settled( ctx );
+		const auto physically_settled = ctx.physically_settled;
 		const auto settled = config.no_spread.value || physically_settled;
-		this->m_settle_ticks = physically_settled
-			? std::min( this->m_settle_ticks + 1, k_settle_ticks_required )
-			: 0;
-		// Precision trusts the engine-simulated state for this exact command.
-		// Once that state is physically settled, waiting for a second command
-		// cannot make the current server shot more accurate and only adds latency.
-		const auto fire_ready = config.no_spread.value || precision || this->m_settle_ticks >= k_settle_ticks_required;
-		const auto accurate = best.valid && ( best.passes_hitchance || best.hitchance >= required - dt_hc_boost ) && settled && fire_ready;
+		// This command's native prediction owns the accuracy vote. A previous
+		// command (or a second invocation of the same command) adds no evidence.
+		const auto accurate = best.valid && ( best.passes_hitchance || best.hitchance >= required - dt_hc_boost ) && settled;
 		const auto maximum_accuracy = g_shared.is_max_accuracy( ctx.predicted_inaccuracy );
 		// Force shot skips the hitchance vote, never the physical stop:
 		// a bullet fired mid-slide only feeds the wall.
@@ -104,13 +328,13 @@ namespace features::combat {
 
 		// Weapon state gate: reloading / empty clip / fire cooldown means
 		// no shot can come out of the brake, so none of the stop modes run.
-		const auto weapon_ready = this->weapon_ready_to_fire( );
+		const auto weapon_ready = this->weapon_ready_to_fire( cmd, local );
 
 		// Landing stop: a qualifying hit already exists while airborne, so
 		// the landing tick itself is braked (see autostop.cpp). An airborne
 		// shot that is already settled and passes hitchance fires first -
 		// the landing reservation is only for shots that must wait.
-		const auto air_shot_ready = best.valid && settled && fire_ready && best.passes_hitchance;
+		const auto air_shot_ready = best.valid && settled && best.passes_hitchance;
 		if ( weapon_ready && config.autostop.value && config.autostop_on_landing.value && allow_fire && !space && !air_shot_ready )
 		{
 			if ( !ctx.on_ground && best.valid && g_misc.autostop( ).request_landing( cmd, local ) )
@@ -125,7 +349,7 @@ namespace features::combat {
 			{
 				result.mode = autostop_mode::ground;
 				result.landing_follow_through = true;
-				result.ready_to_fire = best.valid && best.passes_hitchance && settled && fire_ready;
+				result.ready_to_fire = best.valid && best.passes_hitchance && settled;
 				return result;
 			}
 		}
@@ -134,21 +358,15 @@ namespace features::combat {
 		{
 			if ( ctx.on_ground )
 			{
-				// Stop when the scan already produced a qualifying hit
-				// (direct or through a wall), or - with early stop - when
-				// braking right now lands on a spot that can produce one.
-				// Short-circuit: only evaluate early brake if no current hit exists.
-				if ( best.valid || ( config.autostop_early.value && !space && this->hittable_after_brake( ctx, local, candidates ) ) )
-				{
-					if ( speed > ctx.accurate_threshold || !settled )
-						result.mode = autostop_mode::ground;
-				}
+				// Early ground planning already ran once, before prediction and HC.
+				if ( best.valid && ( speed > ctx.accurate_threshold || !settled ) )
+					result.mode = autostop_mode::ground;
 			}
 			else if ( config.autostop_in_air.value )
 			{
 				// Air stop: counter input cancels horizontal slide both for
 				// an immediate hit and for the predicted landing spot.
-				if ( best.valid || ( !space && this->hittable_after_landing( ctx, local, candidates ) ) )
+				if ( best.valid || ( !space && this->hittable_after_landing( ctx, scan, local, candidates ) ) )
 					result.mode = autostop_mode::air;
 			}
 		}
@@ -157,19 +375,17 @@ namespace features::combat {
 		return result;
 	}
 
-	bool rage::duckpeek_stand_viable( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
+	bool rage::duckpeek_stand_viable( const aim_context& ctx, const scan_config& scan, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
 	{
 		if ( candidates.empty( ) ) return false;
 
-		auto eye = ctx.eyes.count > 0 ? ctx.eyes.entries[ 0 ].position : g_shared.get_shoot_position( );
-		if ( eye.length_sqr( ) < 1.0f ) eye = g_shared.get_eye_position( local.pawn );
+		// Pair the current eye with the current duck amount. Historical shot
+		// eyes can still be crouched after the live pawn has started standing.
+		auto eye = g_shared.get_eye_position( local.pawn );
 		if ( eye.length_sqr( ) < 1.0f ) return false;
 
-		// Mirror the fake-stand camera (misc::duckpeek::on_override_view):
-		// the assist already shows the standing view while the body is still
-		// crouched, so probe the shot from that same raised eye. If it can
-		// deal damage, stand the body up and let the real standing-eye scan
-		// take over next tick.
+		// Probe standing geometry only; real shots retain their scanned eye.
+		// Keep the first-person fake-standing view's existing height delta.
 		const auto movement_services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
 		if ( movement_services )
 		{
@@ -177,16 +393,24 @@ namespace features::combat {
 			eye.z += 18.0f * duck_amount;
 		}
 
-		return this->any_damage_from_eye( eye, ctx, candidates, local );
+		return this->any_damage_from_eye( eye, ctx, scan, candidates, local );
 	}
 
-	void rage::run_gun( systems::input::usercmd* cmd, const aim_context& ctx, const systems::local::snapshot& local, bool allow_fire, bool visual_only )
+	void rage::run_gun( systems::input::usercmd* cmd, const aim_context& initial_ctx, const systems::local::snapshot& local, bool allow_fire, bool visual_only )
 	{
+		if ( !cmd || !cmd->csgo_user_cmd.base( ) ) return;
+		auto ctx = initial_ctx;
 		const auto landing_pending = this->m_landing_stop_active;
 		this->m_landing_stop_active = false;
-		if ( !settings::g_combat.m_ragebot.enabled ) return;
+		if ( !settings::g_combat.m_ragebot.enabled )
+		{
+			this->m_stats.set_reason( rage_stats::no_fire_reason::disabled );
+			return;
+		}
 		const auto& weapon = g_shared.ctx( );
 		const auto& config = settings::g_combat.m_ragebot.get_group( weapon.weapon_type );
+		this->m_stats.set_mode( diagnostic_mode( config ) );
+		this->m_stats.set_config_hash( weapon_config_hash( config ) );
 		// AA_FIRE_DIAGNOSTICS_BEGIN
 		// Same command cadence as the pipeline trace; never re-run scan/stop decisions.
 		static thread_local int diagnostic_aa_mode{ -1 };
@@ -207,86 +431,141 @@ namespace features::combat {
 				"inacc=%.7f standing=%.7f eyes=%d settled=%d ns=%d precision=%d allow=%d visual=%d hc=%.5f required=%.5f ready=%d",
 				cmd->command_number, diagnostic_aa, reason, static_cast<int>( ctx.prediction_valid ), static_cast<int>( ctx.on_ground ),
 				ctx.velocity.length_2d( ), ctx.accurate_threshold, ctx.predicted_inaccuracy, ctx.standing_inaccuracy,
-				ctx.eyes.count, this->m_settle_ticks, static_cast<int>( config.no_spread.value ),
+				ctx.eyes.count, static_cast<int>( ctx.physically_settled ), static_cast<int>( config.no_spread.value ),
 				static_cast<int>( settings::g_combat.m_ragebot.precision.value ), static_cast<int>( allow_fire ), static_cast<int>( visual_only ),
 				hitchance, static_cast<float>( config.hitchance_override.value ? config.hitchance_override_value : config.hitchance ) / 100.0f,
 				static_cast<int>( ready ) );
 		};
 		// AA_FIRE_DIAGNOSTICS_END
-		auto candidates = gather_candidates( local );
+
+		const auto scan = this->make_scan_config( config );
+		std::vector<candidate> candidates{};
+		{
+			stats_timer timer( this->m_stats.time( ).prepare_ns );
+			candidates = gather_candidates( local );
+			if ( !candidates.empty( ) ) this->prepare_scan_targets( candidates );
+		}
+		this->m_stats.work( ).enemies = static_cast<int>( candidates.size( ) );
+		{
+			auto records = 0;
+			for ( const auto& cand : candidates ) records += cand.record_count;
+			this->m_stats.work( ).records = records;
+		}
 		{
 			std::lock_guard lock( m_debug_mtx );
 			m_debug_points.clear( );
 		}
+
+		// Every exit records why no shot left; the submission path clears it.
+		auto no_fire = rage_stats::no_fire_reason::no_best;
+		struct reason_scope
+		{
+			rage_stats& stats;
+			rage_stats::no_fire_reason& reason;
+			~reason_scope( ) { stats.set_reason( reason ); }
+		} reason_writer{ this->m_stats, no_fire };
+
 		if ( candidates.empty( ) )
 		{
+			no_fire = rage_stats::no_fire_reason::no_candidates;
 			// AA_FIRE_DIAGNOSTICS_BEGIN
 			trace_decision( "no-candidates" );
 			// AA_FIRE_DIAGNOSTICS_END
-			this->m_settle_ticks = 0;
 			return;
 		}
 
-		const auto inaccuracy = config.no_spread.value ? g_shared.get_inaccuracy( false ) : ctx.predicted_inaccuracy;
-		std::vector<scan_hit> hits{};
-		for ( auto eye_index = 0; eye_index < ctx.eyes.count; ++eye_index )
+		auto inaccuracy = config.no_spread.value ? g_shared.get_inaccuracy( false ) : ctx.predicted_inaccuracy;
+		auto& hits = this->m_scan_hits;
+		const auto scan_current_context = [ & ]
 		{
-			auto eye_hits = scan_players( ctx.eyes.entries[ eye_index ].position, inaccuracy, ctx, candidates, local );
-			for ( auto& hit : eye_hits ) { hit.source_eye = ctx.eyes.entries[ eye_index ]; hits.push_back( std::move( hit ) ); }
+			hits.clear( );
+			const auto begin = k_rage_diagnostics ? steady_now_ns( ) : 0;
+			this->m_stats.work( ).eyes = ctx.eyes.count;
+			for ( auto eye_index = 0; eye_index < ctx.eyes.count; ++eye_index )
+			{
+				this->scan_players( ctx.eyes.entries[ eye_index ].position, eye_index, inaccuracy, ctx, scan, candidates, local, this->m_view_hits, &this->m_stats );
+				for ( auto& hit : this->m_view_hits )
+				{
+					hit.source_eye = ctx.eyes.entries[ eye_index ];
+					hits.push_back( hit );
+				}
+			}
+			if constexpr ( k_rage_diagnostics ) this->m_stats.time( ).scan_ns += steady_now_ns( ) - begin;
+		};
+		scan_current_context( );
+
+		// Damage establishes stop intent; hitchance must see the brake, not the
+		// original movement input. At most one independent re-prediction runs,
+		// followed by a fresh geometry scan from its actual eye/spread state.
+		// No HC sampling is spent on the superseded, unbraked context.
+		auto ground_brake_applied = false;
+		const auto space = ( GetAsyncKeyState( VK_SPACE ) & 0x8000 ) != 0 ||
+			( cmd && ( cmd->buttons.value & cstypes::command_buttons::in_jump ) );
+		if ( !visual_only && config.autostop.value && ctx.on_ground && !space &&
+			this->weapon_ready_to_fire( cmd, local ) &&
+			( ( !hits.empty( ) && ( ctx.velocity.length_2d( ) > ctx.accurate_threshold ||
+					( !config.no_spread.value && !ctx.physically_settled ) ) ) ||
+				( hits.empty( ) && config.autostop_early.value && this->hittable_after_brake( ctx, scan, local, candidates ) ) ) )
+		{
+			auto* base = cmd->csgo_user_cmd.mutable_base( );
+			const auto forward = base->forwardmove( );
+			const auto left = base->leftmove( );
+			const auto buttons = cmd->buttons;
+			g_misc.autostop( ).write_brake_input( cmd, autostop_mode::ground );
+			ground_brake_applied = true;
+			this->m_stop_mode = autostop_mode::ground;
+			if ( forward != base->forwardmove( ) || left != base->leftmove( ) ||
+				buttons.value != cmd->buttons.value || buttons.value_changed != cmd->buttons.value_changed ||
+				buttons.value_scroll != cmd->buttons.value_scroll )
+			{
+				this->m_stats.repredicted( );
+				{
+					stats_timer timer( this->m_stats.time( ).prediction_ns );
+					ctx = this->build_context( cmd, local );
+				}
+				inaccuracy = config.no_spread.value ? g_shared.get_inaccuracy( false ) : ctx.predicted_inaccuracy;
+				{
+					std::lock_guard lock( m_debug_mtx );
+					m_debug_points.clear( );
+				}
+				this->m_stats.rescanned( );
+				scan_current_context( );
+			}
 		}
+
+		// Geometry owns posture, not hitchance, shot submission or cooldown.
+		// Keep this before visual_only so cooldown scans make the same vote.
+		if ( settings::g_combat.m_duckpeek.enabled.value && ctx.on_ground )
+		{
+			this->m_release_duck_for_shot = !hits.empty( ) || this->duckpeek_stand_viable( ctx, scan, local, candidates );
+		}
+
 		if ( hits.empty( ) )
 		{
+			no_fire = rage_stats::no_fire_reason::no_hits;
 			// AA_FIRE_DIAGNOSTICS_BEGIN
 			trace_decision( "no-hits" );
 			// AA_FIRE_DIAGNOSTICS_END
-			// No current shot: anticipate the peek. Braking now settles the
-			// player at a spot that can still produce a qualifying hit.
-			// settle 计数不复位：物理急停状态与目标可见性无关，扫描闪烁
-			// 清零会让开门后的射击多等两个确认 tick。
-			if ( !visual_only && this->should_brake_early( ctx, local, candidates ) )
-			{
-				this->m_stop_mode = autostop_mode::ground;
-			}
-			// Duck peek: the crouched eye cannot hit yet, but if the raised
-			// (standing) eye can, stand up now so the next scan fires from the
-			// standing eye. Without this the assist stays crouched forever
-			// whenever the shot only opens while standing.
-			if ( !visual_only && settings::g_combat.m_duckpeek.enabled.value && ctx.on_ground && allow_fire &&
-				this->duckpeek_stand_viable( ctx, local, candidates ) )
-			{
-				this->m_release_duck_for_shot = true;
-			}
+			// Keep this command's brake even if its updated eye loses the shot.
 			return;
 		}
-		const auto best = select_best( ctx, hits, inaccuracy );
 
 		if ( settings::g_esp.m_player.m_chams.hittable.enabled.value ) publish_visual_hits( hits );
 		if ( visual_only )
 		{
+			no_fire = rage_stats::no_fire_reason::visual_only;
 			// AA_FIRE_DIAGNOSTICS_BEGIN
 			trace_decision( "visual-only" );
 			// AA_FIRE_DIAGNOSTICS_END
-			this->m_settle_ticks = 0;
-			return;
-		}
-		if ( !best.valid )
-		{
-			// AA_FIRE_DIAGNOSTICS_BEGIN
-			trace_decision( "no-best" );
-			// AA_FIRE_DIAGNOSTICS_END
-			// settle 计数不复位（同上：扫描闪烁不改物理状态）。
-			if ( this->should_brake_early( ctx, local, candidates ) )
-			{
-				this->m_stop_mode = autostop_mode::ground;
-			}
 			return;
 		}
 
 		if ( settings::g_combat.m_autos.scope.value && weapon.weapon_type == cstypes::weapon_type::sniper
 			&& !weapon.is_scoped && !this->m_double_tap.second_pending( ) )
 		{
+			no_fire = rage_stats::no_fire_reason::scope;
 			// AA_FIRE_DIAGNOSTICS_BEGIN
-			trace_decision( "auto-scope", best.hitchance );
+			trace_decision( "auto-scope" );
 			// AA_FIRE_DIAGNOSTICS_END
 			cmd->buttons.value |= cstypes::command_buttons::in_second_attack;
 			cmd->buttons.value_changed |= cstypes::command_buttons::in_second_attack;
@@ -294,11 +573,23 @@ namespace features::combat {
 			return;
 		}
 
-		const auto decision = decide_stop( cmd, ctx, best, candidates, local, allow_fire, landing_pending );
-		this->m_stop_mode = decision.mode;
+		target best{};
+		{
+			stats_timer timer( this->m_stats.time( ).select_ns );
+			best = this->select_best( ctx, hits, inaccuracy, &this->m_stats );
+		}
+		if ( !best.valid )
+		{
+			no_fire = rage_stats::no_fire_reason::no_best;
+			// AA_FIRE_DIAGNOSTICS_BEGIN
+			trace_decision( "no-best" );
+			// AA_FIRE_DIAGNOSTICS_END
+			return;
+		}
+
+		const auto decision = this->decide_stop( cmd, ctx, scan, best, candidates, local, allow_fire, landing_pending );
+		this->m_stop_mode = ground_brake_applied ? autostop_mode::ground : decision.mode;
 		this->m_landing_stop_active = decision.landing_follow_through;
-		const auto duckpeek = settings::g_combat.m_duckpeek.enabled.value && ctx.on_ground;
-		if ( duckpeek && allow_fire ) this->m_release_duck_for_shot = !decision.ready_to_fire;
 
 		// Shot one owns the settle/hitchance vote. Once its pulse is committed,
 		// shot two must use the current scan immediately; post-shot inaccuracy
@@ -309,12 +600,32 @@ namespace features::combat {
 		// AA_FIRE_DIAGNOSTICS_BEGIN
 		trace_decision( "decision", best.hitchance, decision.ready_to_fire || ( dt_second_ready && best.valid && !precision ) );
 		// AA_FIRE_DIAGNOSTICS_END
-		if ( !decision.ready_to_fire && !( dt_second_ready && best.valid && !precision ) ) return;
+		if ( !decision.ready_to_fire && !( dt_second_ready && best.valid && !precision ) )
+		{
+			no_fire = !ctx.prediction_valid ? rage_stats::no_fire_reason::prediction_failed
+				: ( !ctx.physically_settled && !config.no_spread.value ? rage_stats::no_fire_reason::not_settled
+					: rage_stats::no_fire_reason::low_hitchance );
+			return;
+		}
 
-		if ( fire_gun( cmd, best, decision.forced && !best.passes_hitchance, best.hit.source_eye.position, local ) )
+		// Record why this shot is allowed separately from the measured threshold.
+		auto release = fire_reason::none;
+		if ( config.no_spread.value ) release = fire_reason::no_spread;
+		else if ( decision.forced && !best.passes_hitchance ) release = fire_reason::force;
+		else if ( best.passes_hitchance ) release = fire_reason::hitchance;
+		else if ( dt_second_ready ) release = fire_reason::double_tap;
+		else release = fire_reason::hitchance;
+		auto fired = best;
+		fired.reason = release;
+		if ( fire_gun( cmd, fired, decision.forced && !best.passes_hitchance, best.hit.source_eye.position, local ) )
 		{
 			this->m_landing_stop_active = false;
-			if ( duckpeek ) { this->m_duckpeek_reduck = true; this->m_release_duck_for_shot = false; }
+			no_fire = rage_stats::no_fire_reason::none;
+			this->m_stats.submit( release );
+		}
+		else
+		{
+			no_fire = rage_stats::no_fire_reason::submit_failed;
 		}
 		// AA_FIRE_DIAGNOSTICS_BEGIN
 		trace_decision( this->m_firing_this_tick ? "submitted" : "fire-rejected", best.hitchance );
@@ -381,9 +692,9 @@ namespace features::combat {
 
 	float rage::get_min_damage( const settings::combat::ragebot::weapon_group& config, int health, bool override_active ) const
 	{
-		if ( override_active ) return static_cast<float>( config.min_damage_override_value );
-		const auto configured = static_cast<float>( config.min_damage );
-		if ( configured >= 101.0f ) return std::min( static_cast<float>( health ), 101.0f );
-		return health < configured ? static_cast<float>( health ) + 1.0f : configured;
+		if ( override_active ) return static_cast< float >( config.min_damage_override_value );
+		const auto configured = static_cast< float >( config.min_damage );
+		if ( configured >= 101.0f ) return std::min( static_cast< float >( health ), 101.0f );
+		return health < configured ? static_cast< float >( health ) + 1.0f : configured;
 	}
 }

@@ -5320,13 +5320,29 @@ namespace xui {
 
 		if ( is_active )
 		{
+			st.cursor = std::min( st.cursor, buf.size( ) );
+			st.sel_start = std::min( st.sel_start, buf.size( ) );
+			st.sel_end = std::min( st.sel_end, buf.size( ) );
+
 			const auto dt = xdraw::delta_time( );
 			const auto shift = input.shift_held( );
 			const auto ctrl = input.ctrl_held( );
 
-			const auto has_sel = st.sel_start != st.sel_end;
-			const auto sel_min = std::min( st.sel_start, st.sel_end );
-			const auto sel_max = std::max( st.sel_start, st.sel_end );
+			auto erase_selection = [ & ]( ) -> bool
+				{
+					if ( st.sel_start == st.sel_end )
+					{
+						return false;
+					}
+
+					const auto first = std::min( st.sel_start, st.sel_end );
+					const auto last = std::max( st.sel_start, st.sel_end );
+					buf.erase( first, last - first );
+					st.cursor = first;
+					st.sel_start = first;
+					st.sel_end = first;
+					return true;
+				};
 
 			auto process_key = [ & ]( int vk ) -> bool
 				{
@@ -5372,9 +5388,9 @@ namespace xui {
 					while ( st.cursor > 0 && buf[ st.cursor - 1 ] == ' ' ) { st.cursor--; }
 					while ( st.cursor > 0 && buf[ st.cursor - 1 ] != ' ' ) { st.cursor--; }
 				}
-				else if ( has_sel && !shift )
+				else if ( st.sel_start != st.sel_end && !shift )
 				{
-					st.cursor = sel_min;
+					st.cursor = std::min( st.sel_start, st.sel_end );
 				}
 				else if ( st.cursor > 0 )
 				{
@@ -5401,9 +5417,9 @@ namespace xui {
 					while ( st.cursor < buf.size( ) && buf[ st.cursor ] != ' ' ) { st.cursor++; }
 					while ( st.cursor < buf.size( ) && buf[ st.cursor ] == ' ' ) { st.cursor++; }
 				}
-				else if ( has_sel && !shift )
+				else if ( st.sel_start != st.sel_end && !shift )
 				{
-					st.cursor = sel_max;
+					st.cursor = std::max( st.sel_start, st.sel_end );
 				}
 				else if ( st.cursor < buf.size( ) )
 				{
@@ -5464,10 +5480,8 @@ namespace xui {
 			{
 				st.blink_timer = 0.0f;
 
-				if ( has_sel )
+				if ( erase_selection( ) )
 				{
-					buf.erase( sel_min, sel_max - sel_min );
-					st.cursor = sel_min;
 					changed = true;
 				}
 				else if ( st.cursor > 0 )
@@ -5497,10 +5511,8 @@ namespace xui {
 			{
 				st.blink_timer = 0.0f;
 
-				if ( has_sel )
+				if ( erase_selection( ) )
 				{
-					buf.erase( sel_min, sel_max - sel_min );
-					st.cursor = sel_min;
 					changed = true;
 				}
 				else if ( st.cursor < buf.size( ) )
@@ -5531,15 +5543,11 @@ namespace xui {
 
 			for ( const auto wch : input.chars( ) )
 			{
-				if ( buf.size( ) < max_len )
+				const auto selection_length = std::max( st.sel_start, st.sel_end ) - std::min( st.sel_start, st.sel_end );
+				if ( buf.size( ) - selection_length < max_len )
 				{
 					st.blink_timer = 0.0f;
-
-					if ( has_sel )
-					{
-						buf.erase( sel_min, sel_max - sel_min );
-						st.cursor = sel_min;
-					}
+					erase_selection( );
 
 					buf.insert( st.cursor, 1, static_cast< char >( wch ) );
 					st.cursor++;

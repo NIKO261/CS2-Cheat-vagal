@@ -122,6 +122,7 @@ namespace hooks {
 			{ &m_render_crosshair, &render_crosshair, xs ("render_crosshair"), PATTERN (patterns::render_crosshair) },
 			{ &m_prepare_scene_material, &prepare_scene_material, xs ("prepare_scene_material"), PATTERN (patterns::prepare_scene_material) },
 			{ &m_update_animation_state, &update_animation_state, xs ("update_animation_state"), PATTERN (patterns::update_animation_state) },
+			{ &m_pawn_on_land, &pawn_on_land, xs ("pawn_on_land"), PATTERN (patterns::pawn_on_land) },
 			{ &m_post_network_data_received, &post_network_data_received, xs ("post_network_data_received"), PATTERN (patterns::post_network_data_received) },
 			{ &m_draw_overhead, &draw_overhead, xs ("draw_overhead"), PATTERN (patterns::draw_overhead) },
 			{ &m_draw_legs, &draw_legs, xs ("draw_legs"), PATTERN (patterns::draw_legs) },
@@ -146,6 +147,8 @@ namespace hooks {
 		}
 
 		systems::g_prediction.set_animation_isolation_ready( m_update_animation_state.is_enabled( ) );
+		systems::g_prediction.set_landing_observation_ready( m_pawn_on_land.is_enabled( ) );
+		logging::console::print( xs( "prediction landing observer: hooked={}" ), m_pawn_on_land.is_enabled( ) );
 		logging::console::print( xs( "prediction animation isolation: hooked={}" ), m_update_animation_state.is_enabled( ) );
 
 		if ( unavailable_hooks ) {
@@ -160,6 +163,8 @@ namespace hooks {
 	void cheat::shutdown( )
 	{
 		systems::g_prediction.set_animation_isolation_ready( false );
+		systems::g_prediction.set_landing_observation_ready( false );
+		m_pawn_on_land.reset( );
 		m_update_animation_state.reset( );
 		m_wnd_proc.reset( );
 		m_om_set_render_targets.reset( );
@@ -605,7 +610,6 @@ namespace hooks {
 
 			{
 				diag::set_exception_phase( "create_move: shared update" );
-				features::movement::g_airstrafe.store_angles( );
 				features::combat::g_shared.update( );
 
 				diag::set_exception_phase( "create_move: combat misc" );
@@ -657,7 +661,6 @@ namespace hooks {
 
 				diag::set_exception_phase( "create_move: post-combat movement" );
 				features::combat::g_misc.duckpeek( ).on_create_move( current_cmd );
-				features::movement::g_test_strafer.on_create_move( current_cmd );
 				features::movement::g_airstrafe.on_create_move( current_cmd );
 				features::misc::g_projectile_trajectory.on_create_move( current_cmd );
 			}
@@ -679,19 +682,18 @@ namespace hooks {
 
 			diag::set_exception_phase( "create_move: movement fix" );
 			features::movement::g_movement_fix.finish( current_cmd );
+
+			// Build the movement anchor and DT pulse before predicting landing input.
+			// apply() mirrors buttons and calculates the final move CRC.
+			diag::set_exception_phase( "create_move: input movement anchor" );
+			systems::g_input.prepare_subtick_movement( );
+			diag::set_exception_phase( "create_move: double tap finalize" );
+			features::combat::g_rage.dt( ).finalize_command( current_cmd );
 			diag::set_exception_phase( "create_move: landing candidates" );
 			features::movement::g_edgebug.finish_prediction( current_cmd );
 			features::movement::g_jumpbug.finish_prediction( current_cmd );
 			diag::set_exception_phase( "create_move: perfect bhop" );
 			features::movement::g_bhop.finish_prediction( current_cmd );
-
-			// Build the fallback movement anchor first, then let DT append and
-			// sort its attack pulse as the final subtick writer. apply() remains
-			// responsible for button mirroring and the final move CRC.
-			diag::set_exception_phase( "create_move: input movement anchor" );
-			systems::g_input.prepare_subtick_movement( );
-			diag::set_exception_phase( "create_move: double tap finalize" );
-			features::combat::g_rage.dt( ).finalize_command( current_cmd );
 			// AA_FIRE_DIAGNOSTICS_BEGIN
 			trace_command( "pre-shadow" );
 			// AA_FIRE_DIAGNOSTICS_END
@@ -1086,6 +1088,20 @@ namespace hooks {
 		m_update_animation_state.call<void>( thisptr );
 	}
 
+	void __fastcall cheat::pawn_on_land( std::uintptr_t pawn, float fall_speed )
+	{
+		// Observe only: never mute or skip the engine's real landing callback.
+		if ( systems::g_prediction.is_simulating_pawn( pawn ) )
+		{
+			const auto services = memory::read<std::uintptr_t>( pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
+			const auto buttons_offset = SCHEMA( "CPlayer_MovementServices", "m_nButtons"_hash );
+			const auto held = services && buttons_offset > 0
+				&& ( memory::read<systems::input::in_button_state>( services + buttons_offset ).value & cstypes::command_buttons::in_duck ) != 0;
+			systems::g_prediction.observe_landing( pawn, held );
+		}
+		m_pawn_on_land.call<void>( pawn, fall_speed );
+	}
+
 	void __fastcall cheat::post_network_data_received( std::uintptr_t thisptr )
 	{
 		m_post_network_data_received.call<void>( thisptr );
@@ -1218,7 +1234,7 @@ namespace hooks {
 #endif
 
 		static const auto base_fire_guns_get_inaccuracy = PATTERN( patterns::base_fire_guns_get_inaccuracy );
-		if ( !features::combat::g_rage.is_no_spread_state_prediction( ) && base_fire_guns_get_inaccuracy &&
+		if ( !systems::g_prediction.is_simulating( ) && !features::combat::g_rage.is_no_spread_state_prediction( ) && base_fire_guns_get_inaccuracy &&
 			result_address > base_fire_guns_get_inaccuracy &&
 			result_address < base_fire_guns_get_inaccuracy + 0x600 )
 		{
@@ -1234,7 +1250,8 @@ namespace hooks {
 
 		// Prediction calls this helper while building the next command as well.
 		// Only the call made for an actual rage shot is its authoritative origin.
-		if ( features::combat::g_rage.is_firing_this_tick( ) && !features::combat::g_rage.is_no_spread_state_prediction( ) )
+		if ( !systems::g_prediction.is_simulating( ) && features::combat::g_rage.is_firing_this_tick( )
+			&& !features::combat::g_rage.is_no_spread_state_prediction( ) )
 		{
 			features::misc::g_impacts.on_get_interpolated_shoot_position( thisptr, out );
 		}

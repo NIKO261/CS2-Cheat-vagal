@@ -182,9 +182,11 @@ namespace features::combat {
 		}
 		if ( ( GetAsyncKeyState( VK_SPACE ) & 0x8000 ) != 0 || ( cmd->buttons.value & cstypes::command_buttons::in_jump ) ) return;
 		const auto& velocity = systems::g_prediction.pre( ).velocity;
-		if ( velocity.length_2d( ) <= 0.1f ) return;
+		if ( !finite( velocity ) ) return;
 		clear_jump( cmd );
-		write_counter_move( cmd, counter_input( velocity ) );
+		// A stopped player still needs neutral input: retaining the user's
+		// movement here would accelerate again before the shot is resolved.
+		write_counter_move( cmd, velocity.length_2d( ) <= 0.1f ? math::vector2{} : counter_input( velocity ) );
 	}
 
 	void misc::autostop::on_create_move( systems::input::usercmd* cmd )
@@ -194,7 +196,7 @@ namespace features::combat {
 		if ( mode == autostop_mode::none ) return;
 		const auto local = systems::g_local.get( );
 		if ( !local.pawn || !cmd->csgo_user_cmd.mutable_base( ) ) return;
-		if ( mode == autostop_mode::air )
+		if ( mode == autostop_mode::ground || mode == autostop_mode::air )
 		{
 			this->write_brake_input( cmd, mode );
 			return;
@@ -211,12 +213,6 @@ namespace features::combat {
 
 		clear_jump( cmd );
 		const auto move = counter_input( velocity );
-
-		if ( mode == autostop_mode::ground )
-		{
-			write_counter_move( cmd, move );
-			return;
-		}
 
 		if ( this->m_landing_command != cmd->command_number || !this->m_landing_prediction ) return;
 		if ( this->m_landing_prediction->ticks > 0 )

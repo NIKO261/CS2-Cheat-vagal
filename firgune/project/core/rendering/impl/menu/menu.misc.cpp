@@ -208,12 +208,10 @@ namespace rendering {
 					xui::end_popup( );
 				}
 				xui::checkbox( "wasd steering", mov.bhop_wasd_steering );
-				xui::checkbox( "airstrafe", mov.airstrafe );
-
-				xui::checkbox( "autostrafe", mov.m_test_strafer.enabled );
+				xui::checkbox( "autostrafe", mov.airstrafe );
 				if ( xui::begin_popup( "##autostrafe_popup", 220.0f ) )
 				{
-					xui::slider_int( "smoothness##as", mov.m_test_strafer.smoothness, 0, 100, "%d%%" );
+					xui::slider_int( "smoothness##as", mov.autostrafe_smoothness, 0, 100, "%d%%" );
 					xui::end_popup( );
 				}
 				xui::checkbox( "jumpbug / edgebug", mov.landing_assist );

@@ -150,6 +150,15 @@ namespace rendering {
 		bool m_ui_assets_ready{ false };
 	};
 
+	namespace detail
+	{
+		// 配置页（menu.config.cpp）与顶栏配置下拉（menu.core.cpp）共用这一份列表：
+		// 配置页加载/保存/删除后置 needs_refresh，两侧下一帧都会重新拉取。
+		extern std::vector<std::wstring> config_list;
+		extern int selected;
+		extern bool needs_refresh;
+	}
+
     class menu
     {
     public:
@@ -178,7 +187,6 @@ namespace rendering {
 		bool draw_intro( );
         void draw_side_bar( float h );
         void draw_top_bar( float w );
-        void draw_theme_swatches( float sb_x, float avatar_y );
         void apply_theme_preset( int preset );
         void sync_theme_style( ) const;
         void draw_search_results( float x, float y, float w, float h );
@@ -218,8 +226,6 @@ namespace rendering {
 
         int m_tab{};
         int m_subtab{};
-        int m_subtab_pill_tab{ -1 };
-        float m_subtab_pill_offset_x{ -1.0f };
 		float m_intro_visible_elapsed{};
 		float m_intro_displayed_progress{};
 		float m_intro_stage_elapsed{};
@@ -229,6 +235,9 @@ namespace rendering {
 		bool m_intro_finished{};
 		bool m_search_open{};
 		bool m_profile_page{};
+		bool m_config_items_dirty{ true };
+		std::vector<std::string> m_config_names{};
+		std::vector<const char*> m_config_items{};
 		int m_theme_preset{};
 		std::string m_search_query{};
 		std::vector<std::size_t> m_search_visible_indices{};
@@ -256,7 +265,7 @@ namespace rendering {
             };
 
             entry menu_header{};
-            entry tabs[ 7 ]{};
+            entry tabs[ static_cast< std::size_t >( tab::count ) ]{};
             entry search{};
             entry settings{};
             entry cfg_folder_on{};

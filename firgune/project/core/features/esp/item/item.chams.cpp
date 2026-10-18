@@ -74,13 +74,11 @@ namespace features::esp::item {
 	void chams::apply_layer( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, const xdraw::color& color, settings::esp::cham_ids material_id )
 	{
 		const auto before = detail::read_primitive_buffer( primitive_buffer );
-		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
 		const auto after = detail::read_primitive_buffer( primitive_buffer );
-		const auto new_count = after ? after->count() : -1;
-		if ( !after || prev_count < 0 || prev_count >= new_count )
+		if ( !before || !after )
 		{
 			return;
 		}
@@ -91,10 +89,10 @@ namespace features::esp::item {
 			return;
 		}
 
-		for ( auto i = prev_count; i < new_count; ++i )
+		after->for_each_added( *before, [ & ]( std::uintptr_t primitive )
 		{
-			detail::replace_primitive( after->at( i ), material, color );
-		}
+			detail::replace_primitive( primitive, material, color );
+		} );
 	}
 
 	std::uint32_t chams::get_item_group( std::uint32_t schema_hash )

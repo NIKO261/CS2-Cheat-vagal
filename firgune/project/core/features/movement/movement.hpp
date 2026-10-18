@@ -25,8 +25,11 @@ namespace features::movement {
 		void on_create_move( systems::input::usercmd* cmd );
 		void finish_prediction( systems::input::usercmd* cmd );
 		[[nodiscard]] int subtick_reserve( ) const { return this->m_prediction_pending ? 3 : 0; }
+		[[nodiscard]] bool suppressed_jump( const systems::input::usercmd* cmd ) const;
 
 	private:
+		const systems::input::usercmd* m_suppressed_jump_command{};
+		std::intptr_t m_suppressed_jump_number{ -1 };
 		std::intptr_t m_prediction_command{ -1 };
 		std::uintptr_t m_prediction_pawn{};
 		bool m_prediction_pending{};
@@ -36,17 +39,23 @@ namespace features::movement {
 	{
 	public:
 		void on_create_move( systems::input::usercmd* cmd );
-		void store_angles( );
+		[[nodiscard]] bool finish( systems::input::usercmd* cmd );
+		void cancel_pending( ) { this->m_pending = false; }
 
 	private:
-		void check_button( std::uintptr_t current_buttons, std::uintptr_t button );
-		void rotate_movement( proto::base_usercmd_pb* base, float target_yaw, float view_yaw ) const;
 		void rotate_to_stop( proto::base_usercmd_pb* base, const math::vector3& velocity ) const;
 
+		systems::input::usercmd* m_command{};
+		std::intptr_t m_command_number{ -1 };
+		std::uintptr_t m_pawn{};
 		std::uintptr_t m_last_buttons{};
 		std::uintptr_t m_last_pressed{};
+		std::uintptr_t m_expected_buttons{};
+		math::vector2 m_expected_move{};
+		int m_expected_steps{};
+		float m_target_yaw{};
+		bool m_pending{};
 		bool m_side_switch{};
-		math::vector3 m_angles{};
 	};
 
 	class jumpbug
@@ -61,6 +70,8 @@ namespace features::movement {
 
 		bool m_active_this_tick{ false };
 		bool m_prediction_pending{};
+		bool m_candidate_active{};
+		float m_landing_fraction{ 1.0f };
 		std::intptr_t m_prediction_command{ -1 };
 		std::uintptr_t m_prediction_pawn{};
 	};
@@ -98,9 +109,10 @@ namespace features::movement {
 		bool m_prediction_pending{};
 		std::intptr_t m_prediction_command{ -1 };
 		std::uintptr_t m_prediction_pawn{};
-		float m_hint_when{};
 		int m_needed{};
 		int m_passes{};
+		bool m_include_jump{};
+		float m_landing_fraction{ 1.0f };
 	};
 
 	class slowwalk
@@ -115,23 +127,5 @@ namespace features::movement {
 		void on_create_move( systems::input::usercmd* cmd ) const;
 	};
 
-	class test_strafer
-	{
-	public:
-		void on_create_move( systems::input::usercmd* cmd );
-		[[nodiscard]] bool is_active( ) const;
-		[[nodiscard]] bool handled_this_tick( ) const { return this->m_handled_this_tick; }
-
-	private:
-		[[nodiscard]] bool apply_yaw_subtick( proto::base_usercmd_pb* base, float when, float yaw_delta, float forward_delta = 0.0f, float left_delta = 0.0f ) const;
-		[[nodiscard]] bool apply_analog_subtick( proto::base_usercmd_pb* base, float when, float forward_delta, float left_delta ) const;
-		void check_button( std::uintptr_t current_buttons, std::uintptr_t button );
-		[[nodiscard]] static math::vector2 movement_from_buttons( std::uintptr_t pressed );
-
-		std::uintptr_t m_last_buttons{};
-		std::uintptr_t m_last_pressed{};
-		int m_substep_counter{};
-		bool m_handled_this_tick{};
-	};
 
 } // namespace features::movement

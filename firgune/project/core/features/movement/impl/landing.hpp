@@ -6,6 +6,7 @@
 #include <utilities/memory/memory.hpp>
 #include <core/systems/systems.hpp>
 #include <core/features/features.hpp>
+#include <core/settings.hpp>
 #include <protection/game_addresses.hpp>
 
 // Command-local landing trials. These helpers never persist pawn state:
@@ -24,7 +25,8 @@ namespace features::movement::landing {
 		// Only one landing owner commits. Keep one additional slot for the final
 		// movement anchor; provisional landing requests do not emit input events.
 		const auto reserve = std::max( { g_edgebug.subtick_reserve( ), g_jumpbug.subtick_reserve( ), g_bhop.subtick_reserve( ) } );
-		return std::max( 0, max_steps - moves->size( ) - reserve - 1 );
+		const auto attack_reserve = settings::g_combat.m_ragebot.m_double_tap.enabled.value ? 2 : 0;
+		return std::max( 0, max_steps - moves->size( ) - reserve - attack_reserve - 1 );
 	}
 
 	struct result
@@ -32,6 +34,9 @@ namespace features::movement::landing {
 		bool valid{};
 		bool landed{};
 		bool jumped{};
+		bool impact{};
+		bool penalized{};
+		bool impact_duck_held{};
 		std::uint32_t flags{};
 		math::vector3 velocity{};
 		float speed{};
@@ -42,21 +47,31 @@ namespace features::movement::landing {
 	inline result predict( systems::input::usercmd* cmd, const systems::local::snapshot& local )
 	{
 		result out{};
+		if ( !cmd || !local.pawn || !local.controller || !systems::g_prediction.landing_observation_ready( ) ) return out;
 		const auto services = memory::read<std::uintptr_t>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
 		const auto modern_offset = SCHEMA( "CCSPlayer_MovementServices", "m_ModernJump"_hash );
 		const auto land_tick_offset = SCHEMA( "CCSPlayerModernJump", "m_nLastLandedTick"_hash );
 		const auto land_frac_offset = SCHEMA( "CCSPlayerModernJump", "m_flLastLandedFrac"_hash );
 		const auto jump_tick_offset = SCHEMA( "CCSPlayer_MovementServices", "m_nLastJumpTick"_hash );
 		const auto jump_frac_offset = SCHEMA( "CCSPlayer_MovementServices", "m_flLastJumpFrac"_hash );
+		const auto stamina_offset = SCHEMA( "CCSPlayer_MovementServices", "m_flStamina"_hash );
+		const auto jump_stamina_offset = SCHEMA( "CCSPlayer_MovementServices", "m_flStaminaAtJumpStart"_hash );
+		const auto modifier_offset = SCHEMA( "C_CSPlayerPawn", "m_flVelocityModifier"_hash );
+		const auto legacy = CONVAR( "sv_legacy_jump" );
 		const auto base = cmd->csgo_user_cmd.mutable_base( );
 		auto buttons = base ? const_cast<proto::in_button_state_pb*>( base->buttons_pb( ) ) : nullptr;
 		if ( !services || !local.controller || !buttons || modern_offset <= 0 || land_tick_offset <= 0
-			|| land_frac_offset <= 0 || jump_tick_offset <= 0 || jump_frac_offset <= 0 ) return out;
+			|| land_frac_offset <= 0 || jump_tick_offset <= 0 || jump_frac_offset <= 0 || !legacy
+			|| stamina_offset <= 0 || jump_stamina_offset <= 0 || modifier_offset <= 0 ) return out;
+		const auto legacy_jump = legacy->get<bool>( );
 		const auto modern = services + modern_offset;
 		const auto old_land_tick = memory::read<int>( modern + land_tick_offset );
 		const auto old_land_frac = memory::read<float>( modern + land_frac_offset );
 		const auto old_jump_tick = memory::read<int>( services + jump_tick_offset );
 		const auto old_jump_frac = memory::read<float>( services + jump_frac_offset );
+		const auto old_stamina = memory::read<float>( services + stamina_offset );
+		const auto old_modifier = memory::read<float>( local.pawn + modifier_offset );
+		if ( !std::isfinite( old_stamina ) || !std::isfinite( old_modifier ) ) return out;
 		// Native jump/land writers convert the move-data clock before storing it.
 		// A record changed inside this rolled-back trial belongs to this trial;
 		// its integer tick is not necessarily controller TickBase + 1.
@@ -79,10 +94,98 @@ namespace features::movement::landing {
 				out.jumped = jump_tick >= 0 && ( jump_tick != old_jump_tick || out.jump_when != old_jump_frac )
 					&& std::isfinite( out.jump_when ) && out.jump_when >= 0.0f && out.jump_when < 1.0f
 					&& ( out.flags & cstypes::entity_flags::on_ground ) == 0 && out.velocity.z > 1.0f;
+				const auto stamina = memory::read<float>( services + stamina_offset );
+				const auto jump_stamina = memory::read<float>( services + jump_stamina_offset );
+				const auto modifier = memory::read<float>( local.pawn + modifier_offset );
+				// Observe the real OnLand call in BOTH modes. Animation fields and
+				// generic sound timers also change in air; they are not impact proof.
+				out.impact = systems::g_prediction.landing_observed( );
+				out.impact_duck_held = systems::g_prediction.landing_duck_held( );
+				const auto landing_stamina = out.jumped && !legacy_jump ? jump_stamina : stamina;
+				out.penalized = ( ( !out.jumped || !legacy_jump ) && landing_stamina > old_stamina + 0.001f )
+					|| modifier + 0.001f < old_modifier;
+				out.valid = std::isfinite( out.speed ) && std::isfinite( out.velocity.z ) && std::isfinite( stamina )
+					&& std::isfinite( jump_stamina ) && std::isfinite( modifier );
 			} );
 		*buttons = saved_buttons;
-		out.valid = simulated && std::isfinite( out.speed ) && std::isfinite( out.velocity.z );
+		out.valid = simulated && out.valid && systems::g_prediction.landing_observation_ready( );
 		return out;
+	}
+
+	inline bool preserves_landing( const result& trial, float minimum_speed )
+	{
+		return trial.valid && !trial.impact && !trial.penalized && !trial.landed
+			&& !( trial.flags & cstypes::entity_flags::on_ground )
+			&& trial.speed + speed_tolerance >= minimum_speed;
+	}
+
+	inline bool clean_jump( const result& trial, float when, float minimum_speed )
+	{
+		return preserves_landing( trial, minimum_speed ) && trial.jumped
+			&& std::fabs( trial.jump_when - when ) <= time_step;
+	}
+
+	inline bool clean_edge( const result& trial, float minimum_speed, float incoming_vz, float gravity_step )
+	{
+		// Merely staying airborne also describes an ordinary fall. Require the
+		// native trial to arrest a significant fall without jumping or landing.
+		return preserves_landing( trial, minimum_speed ) && !trial.jumped
+			&& incoming_vz < -2.0f * gravity_step
+			&& trial.velocity.z >= -gravity_step - speed_tolerance
+			&& trial.velocity.z <= speed_tolerance
+			&& trial.velocity.z - incoming_vz > gravity_step;
+	}
+
+	template <typename Apply, typename Accept>
+	inline bool find_timing( systems::input::usercmd* cmd, const systems::local::snapshot& local,
+		float seed, bool single_release, const Apply& apply, const Accept& accept )
+	{
+		constexpr int max_trials = 11;
+		std::array<float, max_trials> tested{};
+		float lower = time_step;
+		float upper = 1.0f - time_step;
+		if ( !std::isfinite( seed ) ) return false;
+		auto when = std::clamp( seed, lower, upper );
+		for ( int attempt = 0; attempt < max_trials; ++attempt )
+		{
+			apply( when );
+			const auto trial = predict( cmd, local );
+			if ( !trial.valid ) return false;
+			if ( accept( trial, when ) ) return true;
+			tested[ attempt ] = when;
+
+			// Only a single duck release has this ordering: OnLand while duck
+			// is held means the release was late; OnLand after it means early.
+			// Multiple duck pulses can have disjoint windows, so never bisect
+			// them using the aggregated impact button state.
+			if ( single_release && trial.impact )
+			{
+				if ( trial.impact_duck_held ) upper = std::min( upper, when );
+				else lower = std::max( lower, when );
+			}
+
+			// If there is no directional evidence, explore a different interval
+			// rather than mistaking an uninterrupted fall for a successful bug.
+			std::array<float, max_trials + 2> boundaries{};
+			int count = 2;
+			boundaries[ 0 ] = lower;
+			boundaries[ 1 ] = upper;
+			for ( int i = 0; i <= attempt; ++i )
+				if ( tested[ i ] > lower && tested[ i ] < upper ) boundaries[ count++ ] = tested[ i ];
+			std::sort( boundaries.begin( ), boundaries.begin( ) + count );
+			float widest = 0.0f;
+			for ( int i = 1; i < count; ++i )
+			{
+				const auto gap = boundaries[ i ] - boundaries[ i - 1 ];
+				if ( gap > widest )
+				{
+					widest = gap;
+					when = ( boundaries[ i ] + boundaries[ i - 1 ] ) * 0.5f;
+				}
+			}
+			if ( widest <= time_step * 0.25f ) break;
+		}
+		return false;
 	}
 
 	inline void set_event( proto::subtick_move_step* step, std::uintptr_t button, bool pressed, float when )
@@ -174,6 +277,12 @@ namespace features::movement::landing {
 						|| ( own && values[ j ].when( ) >= step->when( ) ) )
 					{
 						target = angles[ j ];
+						// Inserted events follow every original event at this time.
+						if ( own && values[ j ].when( ) == step->when( ) )
+						{
+							for ( int next = k + 1; next < original_count && values[ order[ next ] ].when( ) == step->when( ); ++next )
+								target = angles[ order[ next ] ];
+						}
 						break;
 					}
 				}

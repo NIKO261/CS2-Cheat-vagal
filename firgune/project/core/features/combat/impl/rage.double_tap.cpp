@@ -9,6 +9,7 @@ namespace features::combat {
 	namespace {
 		constexpr auto k_pair_window_ticks{ 4 };
 		constexpr auto k_max_claim_lead_ticks{ 256 };
+		constexpr auto k_max_subtick_moves{ 32 };
 		constexpr auto k_attack_press_when{ 0.0f };
 		constexpr auto k_attack_release_when{ 1.0f / 64.0f };
 
@@ -24,7 +25,12 @@ namespace features::combat {
 	{
 		this->m_phase = pair_phase::idle;
 		this->m_intent_command = -1;
+		this->m_first_command = -1;
+		this->m_second_command = -1;
 		this->m_first_claim_tick = -1;
+		this->m_second_claim_tick = -1;
+		this->m_first_clip = 0;
+		this->m_first_observed = false;
 		this->m_pair_deadline = -1;
 		this->m_intent = false;
 		this->m_intent_is_second = false;
@@ -36,6 +42,7 @@ namespace features::combat {
 		this->m_state = charge_state::charging;
 		this->m_fail_reason = fail_reason::none;
 		this->m_weapon = 0;
+		this->m_command = -1;
 		this->m_tick_base = -1;
 		this->m_claim_tick = -1;
 		this->m_cycle_ticks = 1;
@@ -56,7 +63,7 @@ namespace features::combat {
 
 		const auto& cfg = settings::g_combat.m_ragebot.m_double_tap;
 		const auto& ctx = g_shared.ctx( );
-		if ( !cfg.enabled.value || !cmd || !ctx.valid || !ctx.weapon )
+		if ( !cfg.enabled.value || !settings::g_combat.m_ragebot.enabled.value || !cmd || !ctx.valid || !ctx.weapon )
 		{
 			this->reset( );
 			return;
@@ -67,6 +74,7 @@ namespace features::combat {
 			this->reset( );
 			this->m_weapon = ctx.weapon;
 		}
+		this->m_command = cmd->command_number;
 
 		const auto is_gun = ctx.weapon_type >= cstypes::weapon_type::pistol
 			&& ctx.weapon_type <= cstypes::weapon_type::lmg;
@@ -85,10 +93,9 @@ namespace features::combat {
 
 		const auto local = systems::g_local.get( );
 		const auto* base = cmd->csgo_user_cmd.base( );
-		if ( !local.controller || !base )
+		if ( !local.is_alive || !local.pawn || !local.controller || !base )
 		{
-			this->reset_pair( );
-			this->m_claim_valid = false;
+			this->reset( );
 			this->m_state = charge_state::failed;
 			this->m_fail_reason = fail_reason::unavailable;
 			this->m_progress = 0.0f;
@@ -105,24 +112,52 @@ namespace features::combat {
 		// synthesize first_claim + cycle: that was the old scheduler and merely
 		// waited one normal fire interval. A zero/old ready tick is legal; only
 		// a negative or implausibly far-future value is rejected.
-		this->m_claim_valid = cmd->csgo_user_cmd.input_history_size( ) > 0
-			&& this->m_claim_tick >= 0
+		// fire_gun creates missing attack history later in the same command.
+		// An empty native history is not a reason to disable the charge.
+		this->m_claim_valid = this->m_claim_tick >= 0
 			&& this->m_claim_tick <= this->m_tick_base + k_max_claim_lead_ticks;
 		this->m_natural_ready = this->m_claim_valid && base->client_tick( ) >= this->m_claim_tick;
 
-		if ( this->second_pending( ) && ( ctx.in_reload || this->m_clip <= 0 ) )
+		if ( this->m_phase != pair_phase::idle && ( ctx.in_reload || this->m_clip <= 0 ) )
 		{
 			this->reset_pair( );
 		}
-		else if ( this->second_pending( ) && this->m_tick_base > this->m_pair_deadline )
+		else if ( this->m_phase != pair_phase::idle && this->m_command > this->m_first_command
+			&& this->m_command != this->m_second_command && this->m_tick_base > this->m_pair_deadline )
 		{
 			logging::console::print( xs( "[dt] follow-up expired (first claim {}, live claim {})" ),
 				this->m_first_claim_tick, this->m_claim_tick );
 			this->reset_pair( );
 		}
+		else if ( this->m_phase != pair_phase::idle && this->m_command > this->m_first_command
+			&& this->m_command != this->m_second_command )
+		{
+			if ( this->m_clip <= this->m_first_clip - 2 )
+			{
+				// This is live client prediction, not a server hit acknowledgement.
+				// Do not turn two submissions or a rebuilt command into a success.
+				logging::console::print( xs( "[dt] two rounds observed in live weapon state" ) );
+				this->reset_pair( );
+			}
+			else if ( this->m_phase == pair_phase::second_queued )
+			{
+				this->m_first_observed = this->m_clip == this->m_first_clip - 1
+					&& this->m_claim_tick > this->m_first_claim_tick;
+			}
+		}
+
+		if ( this->m_phase == pair_phase::second_submitted && this->m_command == this->m_second_command )
+		{
+			// Rebuild the same second shot with its original claim, never the
+			// newly advanced cooldown that would describe a third bullet.
+			this->m_claim_tick = this->m_second_claim_tick;
+			this->m_claim_valid = this->m_claim_tick >= 0
+				&& this->m_claim_tick <= this->m_tick_base + k_max_claim_lead_ticks;
+		}
 
 		if ( ctx.in_reload )
 		{
+			this->m_claim_valid = false;
 			this->m_state = charge_state::failed;
 			this->m_fail_reason = fail_reason::reloading;
 			this->m_progress = 0.0f;
@@ -144,10 +179,10 @@ namespace features::combat {
 		}
 
 		this->m_fail_reason = fail_reason::none;
-		if ( this->second_pending( ) )
+		if ( this->m_phase != pair_phase::idle )
 		{
-			this->m_state = charge_state::ready;
-			this->m_progress = 0.5f;
+			this->m_state = this->second_ready( ) ? charge_state::ready : charge_state::charging;
+			this->m_progress = this->m_phase == pair_phase::second_queued ? 0.5f : 0.0f;
 			return;
 		}
 
@@ -167,6 +202,7 @@ namespace features::combat {
 	void rage::double_tap::on_shot_intent( systems::input::usercmd* cmd, bool fired )
 	{
 		if ( !fired || !cmd || !this->can_pair( ) ) return;
+		if ( cmd->command_number == this->m_first_command ) return;
 		if ( this->second_pending( ) && !this->second_ready( ) ) return;
 
 		this->m_intent = true;
@@ -194,8 +230,20 @@ namespace features::combat {
 		auto* moves = base->mutable_subtick_moves( );
 		if ( !moves ) return false;
 		const auto original_size = moves->m_current_size;
-		auto* press = systems::g_input.acquire_subtick_step( moves );
-		auto* release = systems::g_input.acquire_subtick_step( moves );
+		proto::subtick_move_step* press{};
+		proto::subtick_move_step* release{};
+		for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
+		{
+			auto* step = base->mutable_subtick_moves( i );
+			if ( !step || step->button( ) != cstypes::command_buttons::in_attack
+				|| step->m_has_bits.test( 0x78u ) ) continue;
+			if ( step->pressed( ) && step->when( ) == k_attack_press_when ) press = step;
+			if ( !step->pressed( ) && step->when( ) == k_attack_release_when ) release = step;
+		}
+		const auto missing_edges = static_cast<int>( !press ) + static_cast<int>( !release );
+		if ( original_size > k_max_subtick_moves - missing_edges ) return false;
+		if ( !press ) press = systems::g_input.acquire_subtick_step( moves );
+		if ( !release ) release = systems::g_input.acquire_subtick_step( moves );
 		if ( !press || !release )
 		{
 			// acquire_subtick_step may consume one reusable slot before the
@@ -248,32 +296,71 @@ namespace features::combat {
 		this->m_intent_is_second = false;
 		this->m_intent_command = -1;
 
-		if ( !this->commit_pulse( cmd, this->m_claim_tick ) )
+		const auto attack = static_cast<std::uintptr_t>( cstypes::command_buttons::in_attack );
+		const auto cancel_followup = [ & ]
 		{
-			// Fail open: fire_gun's original button + history-index expression is
-			// still intact. A failed first pulse never arms a fake pair; a failed
-			// follow-up disarms so later shots return to the normal cooldown gate.
-			if ( second ) this->reset_pair( );
-			logging::console::print( xs( "[dt] pulse unavailable; kept normal fire path" ) );
-			return;
-		}
-
-		if ( second )
-		{
-			logging::console::print( xs( "[dt] follow-up committed at claim {}" ), this->m_claim_tick );
+			cmd->buttons.value &= ~attack;
+			cmd->buttons.value_changed |= attack;
+			cmd->buttons.value_scroll &= ~attack;
+			cmd->csgo_user_cmd.set_attack1_start_history_index( -1 );
+			cmd->csgo_user_cmd.m_has_bits.clear( 0x20u );
+			if ( auto* base = cmd->csgo_user_cmd.mutable_base( ) )
+			{
+				for ( auto i = 0; i < base->subtick_moves_size( ); ++i )
+				{
+					if ( auto* step = base->mutable_subtick_moves( i ); step && ( step->button( ) & attack ) != 0 )
+						step->set_button( step->button( ) & ~attack );
+				}
+			}
 			this->reset_pair( );
 			this->m_state = charge_state::charging;
 			this->m_progress = 0.0f;
+		};
+		const auto index = cmd->csgo_user_cmd.attack1_start_history_index( );
+		if ( ( cmd->buttons.value & attack ) == 0 || index < 0
+			|| index >= cmd->csgo_user_cmd.input_history_size( )
+			|| !cmd->csgo_user_cmd.mutable_input_history( index ) )
+		{
+			if ( second ) cancel_followup( );
 			return;
 		}
 
-		this->m_phase = pair_phase::second_queued;
-		this->m_first_claim_tick = this->m_claim_tick;
-		this->m_pair_deadline = this->m_tick_base + k_pair_window_ticks;
-		this->m_state = charge_state::ready;
-		this->m_progress = 0.5f;
-		logging::console::print( xs( "[dt] first pulse committed at claim {}; follow-up armed" ),
-			this->m_first_claim_tick );
+		if ( !second )
+		{
+			if ( this->m_phase != pair_phase::idle ) return;
+			// Keep the first shot's validated ordinary attack index, time and
+			// NoSpread seed. No stale next-attack claim is stamped over it.
+			this->m_phase = pair_phase::second_queued;
+			this->m_first_command = cmd->command_number;
+			this->m_first_claim_tick = this->m_claim_tick;
+			this->m_first_clip = this->m_clip;
+			this->m_pair_deadline = this->m_tick_base + this->m_cycle_ticks + k_pair_window_ticks;
+			this->m_state = charge_state::charging;
+			this->m_progress = 0.5f;
+			logging::console::print( xs( "[dt] first submitted in command {}; waiting for weapon state" ),
+				this->m_first_command );
+			return;
+		}
+
+		if ( !this->commit_pulse( cmd, this->m_claim_tick ) )
+		{
+			// This intent bypassed the ordinary cooldown. Without a complete DT
+			// pulse it is not a valid normal shot, so never transmit it as one.
+			cancel_followup( );
+			logging::console::print( xs( "[dt] follow-up cancelled: pulse unavailable" ) );
+			return;
+		}
+
+		if ( this->m_phase == pair_phase::second_submitted ) return;
+
+		this->m_phase = pair_phase::second_submitted;
+		this->m_second_command = cmd->command_number;
+		this->m_second_claim_tick = this->m_claim_tick;
+		this->m_pair_deadline = this->m_tick_base + this->m_cycle_ticks + k_pair_window_ticks;
+		this->m_state = charge_state::charging;
+		this->m_progress = 0.0f;
+		logging::console::print( xs( "[dt] follow-up submitted in command {} at live claim {}" ),
+			this->m_second_command, this->m_second_claim_tick );
 	}
 
 	void rage::double_tap::on_render( xdraw::draw_list& draw_list ) const

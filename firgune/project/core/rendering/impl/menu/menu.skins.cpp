@@ -1377,9 +1377,9 @@ namespace rendering {
 		const auto wx = this->m_x;
 		const auto wy = this->m_y;
 		const auto content_x = wx + tokens::gap + tokens::sidebar_w + tokens::gap;
-		const auto body_y = wy + tokens::gap;
+		const auto body_y = wy + tokens::gap + tokens::subtab_bar_h + tokens::gap;
 		const auto content_w = this->m_w - tokens::gap * 2.0f - tokens::sidebar_w - tokens::gap;
-		const auto body_h = this->m_h - tokens::gap * 2.0f;
+		const auto body_h = this->m_h - tokens::gap * 3.0f - tokens::subtab_bar_h;
 
 		const auto dt = xdraw::delta_time( );
 		const auto fade_target = ( detail::skins_ui.current == detail::skins_ui.target ) ? 1.0f : 0.0f;

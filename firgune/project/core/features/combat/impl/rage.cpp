@@ -27,6 +27,11 @@ namespace features::combat {
 	{
 		const auto local = systems::g_local.get( );
 		auto& weapon = g_shared.ctx( );
+		// Diagnostics lifetime is the whole rage command; every exit path is
+		// covered by the finisher, including the early disables below.
+		this->m_stats.begin( cmd ? cmd->command_number : -1 );
+		struct stats_finisher { rage_stats& stats; ~stats_finisher( ) { stats.finish( ); } };
+		stats_finisher finisher{ this->m_stats };
 		this->update_penetration_crosshair( local );
 
 		// Always update DT so weapon switches and unsupported weapons clear a
@@ -44,8 +49,6 @@ namespace features::combat {
 		const auto drop_taser = this->m_zeus_fired;
 		this->m_zeus_fired = false;
 
-		if ( !settings::g_combat.m_duckpeek.enabled.value ) this->m_duckpeek_reduck = false;
-
 		if ( drop_taser && weapon.weapon_type == cstypes::weapon_type::taser &&
 			settings::g_combat.m_zeusbot.drop_after && !systems::g_local.is_in_deathmatch( ) )
 		{
@@ -55,10 +58,10 @@ namespace features::combat {
 
 		if ( !cmd || !weapon.valid || !local.is_alive || !local.pawn || !local.controller )
 		{
+			this->m_stats.set_reason( rage_stats::no_fire_reason::disabled );
 			this->m_no_spread_accuracy.reset( );
 			this->m_no_spread_state_prediction = false;
 			this->m_revolver_cock_ticks = 0;
-			this->m_settle_ticks = 0;
 			this->clear_visual_hit( );
 			return;
 		}
@@ -68,10 +71,10 @@ namespace features::combat {
 		const auto is_gun = weapon.weapon_type >= cstypes::weapon_type::pistol && weapon.weapon_type <= cstypes::weapon_type::lmg;
 		if ( !is_knife && !is_taser && !is_gun )
 		{
+			this->m_stats.set_reason( rage_stats::no_fire_reason::disabled );
 			this->m_no_spread_accuracy.reset( );
 			this->m_no_spread_state_prediction = false;
 			this->m_revolver_cock_ticks = 0;
-			this->m_settle_ticks = 0;
 			return;
 		}
 		if ( !is_gun || !settings::g_combat.m_ragebot.enabled ||
@@ -81,27 +84,26 @@ namespace features::combat {
 			this->m_no_spread_state_prediction = false;
 		}
 
-		// early-stop 结算对齐：counter 输入由管线后段的 autostop 写入，而
-		// settle 预测在 build_context 的 simulate 里跑——模拟看到的永远是
-		// 玩家原始输入，刹车期间门禁看不到减速（白等 tick，目标跑掉/回溯
-		// 记录过期）。上一 tick 已决定 ground/air 刹车时，先把本 tick 的
-		// counter 注入命令：模拟与实际下发的是同一份刹停输入，开火门禁与
-		// 服务端弹道散布一致，急停到出弹不再多等。
-		if ( settings::g_combat.m_ragebot.enabled && !is_knife && !is_taser
-			&& ( previous_stop_mode == autostop_mode::ground || ( previous_stop_mode == autostop_mode::air
-				&& settings::g_combat.m_ragebot.get_group( weapon.weapon_type ).autostop.value
-				&& settings::g_combat.m_ragebot.get_group( weapon.weapon_type ).autostop_in_air.value ) ) )
+		// Air keeps its existing input ownership. Ground braking is planned
+		// from this command's damage scan in run_gun, never a stale stop mode.
+		if ( settings::g_combat.m_ragebot.enabled && is_gun
+			&& previous_stop_mode == autostop_mode::air
+			&& settings::g_combat.m_ragebot.get_group( weapon.weapon_type ).autostop.value
+			&& settings::g_combat.m_ragebot.get_group( weapon.weapon_type ).autostop_in_air.value )
 		{
 			g_misc.autostop( ).write_brake_input( cmd, previous_stop_mode );
 		}
 
-		auto aim = this->build_context( cmd, local );
+		aim_context aim{};
+		{
+			stats_timer timer( this->m_stats.time( ).prediction_ns );
+			aim = this->build_context( cmd, local );
+		}
 		this->m_landing_stop_active = landing_pending;
 		if ( is_knife )
 		{
 			this->m_landing_stop_active = false;
 			this->m_revolver_cock_ticks = 0;
-			this->m_settle_ticks = 0;
 			if ( !g_shared.can_shoot( cmd, local.controller ) )
 			{
 				this->m_double_tap.on_shot_intent( cmd, false );
@@ -115,7 +117,6 @@ namespace features::combat {
 		{
 			this->m_landing_stop_active = false;
 			this->m_revolver_cock_ticks = 0;
-			this->m_settle_ticks = 0;
 			if ( g_shared.can_shoot( cmd, local.controller ) ) this->run_taser( cmd, aim, local );
 			return;
 		}
@@ -134,9 +135,12 @@ namespace features::combat {
 			!this->m_double_tap.bypass_cooldown( ) );
 		if ( !can_fire )
 		{
+			this->m_stats.set_reason( rage_stats::no_fire_reason::cooldown );
 			this->m_landing_stop_active = false;
 			this->m_double_tap.on_shot_intent( cmd, false );
-			if ( settings::g_esp.m_player.m_chams.hittable.enabled.value )
+			// Duck Peek still needs geometry during cooldown; this pass never fires.
+			if ( settings::g_esp.m_player.m_chams.hittable.enabled.value ||
+				( settings::g_combat.m_duckpeek.enabled.value && aim.on_ground ) )
 			{
 				this->run_gun( cmd, aim, local, false, true );
 			}
@@ -192,6 +196,7 @@ namespace features::combat {
 			out.standing_inaccuracy = out.predicted_inaccuracy;
 		}
 
+		out.physically_settled = this->is_physically_settled( out );
 		g_shared.ctx( ).spread = out.spread;
 		g_shared.ctx( ).inaccuracy = out.predicted_inaccuracy;
 		return out;

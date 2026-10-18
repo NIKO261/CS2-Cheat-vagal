@@ -1,15 +1,60 @@
 #include <pch/pch.hpp>
-#include <array>
 #include <utilities/memory/memory.hpp>
 #include <core/systems/systems.hpp>
 #include <core/settings.hpp>
-#include <core/features/features.hpp>
 
 #include "../movement.hpp"
-#include <protection/game_addresses.hpp>
 #include "landing.hpp"
+#include <protection/game_addresses.hpp>
 
 namespace features::movement {
+
+	namespace {
+
+		[[nodiscard]] bool side_has_standable_ground( const math::vector3& at_xy_z_reference, float offset_x, float offset_y, const systems::tracing::bbox_collision& bbox, const systems::tracing::filter& filter, float sv_standable_normal )
+		{
+			const auto start = math::vector3{ at_xy_z_reference.x + offset_x, at_xy_z_reference.y + offset_y, at_xy_z_reference.z + 2.0f };
+			const auto end = math::vector3{ at_xy_z_reference.x + offset_x, at_xy_z_reference.y + offset_y, at_xy_z_reference.z - 4.0f };
+
+			const auto r = systems::g_tracing.trace_player_bbox( start, end, bbox, filter );
+			return r.fraction > 0.0f && r.fraction < 1.0f && r.normal.z >= sv_standable_normal;
+		}
+
+		[[nodiscard]] bool mode_allows( int mode, bool holding_jump, float vel2d, float vz )
+		{
+			switch ( mode )
+			{
+			case 0:
+				return true;
+			case 1:
+				return true;
+			case 2:
+				return !holding_jump;
+			case 3:
+				return vel2d > 15.0f;
+			case 4:
+				return vel2d > 25.0f && vz < -100.0f;
+			default:
+				return true;
+			}
+		}
+
+		[[nodiscard]] bool edge_geometry_ok( int mode, bool left_ok, bool right_ok )
+		{
+			if ( mode == 0 )
+			{
+				return true;
+			}
+
+			if ( left_ok && right_ok )
+			{
+				return false;
+			}
+
+			return true;
+		}
+
+	} // namespace
 
 	void edgebug::on_create_move( systems::input::usercmd* cmd )
 	{
@@ -21,6 +66,7 @@ namespace features::movement {
 			return;
 		}
 
+		const auto mode = std::clamp( settings::g_movement.edgebug_mode.value, 0, 4 );
 		const auto passes = std::clamp( settings::g_movement.edgebug_passes.value, 1, 5 );
 
 		const auto local = systems::g_local.get( );
@@ -30,7 +76,7 @@ namespace features::movement {
 		}
 
 		const auto move_type = memory::read<std::uint8_t>( local.pawn + SCHEMA( "C_BaseEntity", "m_nActualMoveType"_hash ) );
-		if ( move_type == cstypes::move_type::ladder || move_type == cstypes::move_type::noclip || move_type == cstypes::move_type::observer )
+		if ( move_type == cstypes::move_type::ladder || move_type == cstypes::move_type::noclip )
 		{
 			return;
 		}
@@ -41,7 +87,15 @@ namespace features::movement {
 			return;
 		}
 
-		if ( !std::isfinite( prestate.velocity.z ) || prestate.velocity.z >= 0.0f )
+		if ( prestate.networked_velocity.z > 0.0f )
+		{
+			return;
+		}
+
+		const auto holding_jump = ( cmd->buttons.value & cstypes::command_buttons::in_jump ) != 0;
+		const auto vel2d = prestate.networked_velocity.length_2d( );
+
+		if ( !mode_allows( mode, holding_jump, vel2d, prestate.networked_velocity.z ) )
 		{
 			return;
 		}
@@ -52,15 +106,22 @@ namespace features::movement {
 			return;
 		}
 
+		const auto duck_amount = memory::read<float>( movement_services + SCHEMA( "CCSPlayer_MovementServices", "m_flDuckAmount"_hash ) );
 		const auto holding_duck = ( cmd->buttons.value & cstypes::command_buttons::in_duck ) != 0;
-		if ( holding_duck ) return;
 		const auto mins = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseModelEntity", "m_Collision"_hash ) + SCHEMA( "CCollisionProperty", "m_vecMins"_hash ) );
-		const auto maxs = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseModelEntity", "m_Collision"_hash ) + SCHEMA( "CCollisionProperty", "m_vecMaxs"_hash ) );
+		auto maxs = memory::read<math::vector3>( local.pawn + SCHEMA( "C_BaseModelEntity", "m_Collision"_hash ) + SCHEMA( "CCollisionProperty", "m_vecMaxs"_hash ) );
 
-		const auto trace_origin = prestate.networked_origin;
+		auto trace_origin = prestate.networked_origin;
+		{
+			if ( holding_duck && duck_amount > 0.0f )
+			{
+				const auto standing_height{ 72.0f };
+				const auto duck_hull_diff = standing_height - maxs.z;
+				trace_origin.z -= duck_hull_diff * 0.5f;
+				maxs.z = standing_height;
+			}
+		}
 
-		// Movement queries use the pawn's collision attributes, not the shot mask.
-		// Keep the verified generic filter/TraceShape ABI; do not copy stale helpers.
 		const auto collision_offset = SCHEMA( "C_BaseModelEntity", "m_Collision"_hash );
 		const auto attributes_offset = SCHEMA( "CCollisionProperty", "m_collisionAttribute"_hash );
 		const auto interacts_offset = SCHEMA( "VPhysicsCollisionAttribute_t", "m_nInteractsWith"_hash );
@@ -68,6 +129,7 @@ namespace features::movement {
 		auto mask = memory::read<std::uint64_t>( local.pawn + collision_offset + attributes_offset + interacts_offset );
 		if ( prestate.flags & 0x10u ) mask |= 0x20ull;
 		if ( !mask ) return;
+		// Use this project's trace ABI, not the reference's cached-context offset.
 		const auto filter = systems::g_tracing.make_filter( local.pawn, mask, 11 );
 		const auto gravity = CONVAR( "sv_gravity" );
 		const auto standable = CONVAR( "sv_standable_normal" );
@@ -76,7 +138,7 @@ namespace features::movement {
 		const auto sv_standable_normal = standable->get<float>( );
 		const auto gravity_scale = memory::read<float>( local.pawn + SCHEMA( "C_BaseEntity", "m_flGravityScale"_hash ) );
 
-		auto velocity = prestate.velocity;
+		auto velocity = prestate.networked_velocity;
 		velocity.z -= ( gravity_scale * sv_gravity * cstypes::tick_interval ) * 0.5f;
 
 		math::vector3 trace_start = trace_origin;
@@ -86,22 +148,52 @@ namespace features::movement {
 		trace_end.y = trace_origin.y + velocity.y * cstypes::tick_interval;
 		trace_end.z = trace_origin.z + velocity.z * cstypes::tick_interval;
 
-		// Keep this unpadded: the fraction also seeds a within-tick trial time.
+		trace_end.z -= 2.0f;
 
 		const auto bbox = systems::tracing::bbox_collision{ mins, maxs };
 		const auto result = systems::g_tracing.trace_player_bbox( trace_start, trace_end, bbox, filter );
-		const auto valid_trace = ( !result.all_solid && std::isfinite( result.fraction ) && result.fraction >= 0.0f && result.fraction < 1.0f );
+		const auto valid_trace = ( result.fraction > 0.0f && result.fraction < 1.0f );
 
 		if ( !valid_trace || result.normal.z < sv_standable_normal )
 		{
 			return;
 		}
 
-		// Sideways hull probes rejected front/back edges too. Geometry only
-		// schedules trials; final airborne contact/velocity determines success.
-		this->m_hint_when = result.fraction;
+		const auto dot = velocity.x * result.normal.x + velocity.y * result.normal.y;
+		if ( !( result.normal.z >= 0.98f || dot >= 0.0f ) )
+		{
+			return;
+		}
+
+		const auto vel2d_len = std::sqrtf( velocity.x * velocity.x + velocity.y * velocity.y );
+		float perp_x{};
+		float perp_y{};
+		if ( vel2d_len > 0.01f )
+		{
+			perp_x = -velocity.y / vel2d_len;
+			perp_y = velocity.x / vel2d_len;
+		}
+		else
+		{
+			perp_x = 1.0f;
+			perp_y = 0.0f;
+		}
+
+		const auto side_dist = std::max( 14.0f, std::max( std::fabsf( maxs.x ), std::fabsf( maxs.y ) ) * 1.25f );
+		const math::vector3 ground_ref{ result.position.x, result.position.y, trace_origin.z };
+
+		const auto left_ok = side_has_standable_ground( ground_ref, -perp_x * side_dist, -perp_y * side_dist, bbox, filter, sv_standable_normal );
+		const auto right_ok = side_has_standable_ground( ground_ref, perp_x * side_dist, perp_y * side_dist, bbox, filter, sv_standable_normal );
+
+		if ( !edge_geometry_ok( mode, left_ok, right_ok ) )
+		{
+			return;
+		}
+
+		this->m_landing_fraction = std::clamp( result.fraction, 0.001f, 0.99f );
 		this->m_passes = passes;
-		this->m_needed = passes * 2 + 1; // Duck cycles plus a jump release.
+		this->m_include_jump = settings::g_movement.edgebug_include_jump_steps.value && holding_jump;
+		this->m_needed = passes * 2 + ( this->m_include_jump ? 2 : 0 );
 		this->m_prediction_command = cmd->command_number;
 		this->m_prediction_pawn = local.pawn;
 		this->m_prediction_pending = true;
@@ -110,60 +202,44 @@ namespace features::movement {
 	void edgebug::finish_prediction( systems::input::usercmd* cmd )
 	{
 		if ( !this->m_prediction_pending ) return;
-		const auto number = this->m_prediction_command;
-		const auto pawn = this->m_prediction_pawn;
 		this->m_prediction_pending = false;
 		const auto local = systems::g_local.get( );
-		if ( !cmd || cmd->command_number != number || local.pawn != pawn || !local.controller || !local.is_alive
-			|| !settings::g_movement.landing_assist.value || features::combat::g_rage.should_stop( )
-			|| ( cmd->buttons.value & landing::duck ) ) return;
-		systems::g_input.prepare_subtick_movement( );
+		if ( !cmd || cmd->command_number != this->m_prediction_command || local.pawn != this->m_prediction_pawn
+			|| !local.controller || !local.is_alive || !settings::g_movement.landing_assist.value
+			|| features::combat::g_rage.should_stop( ) ) return;
 		const auto baseline = landing::predict( cmd, local );
 		if ( !baseline.valid ) return;
-		landing::transaction candidate{ cmd, this->m_needed };
-		if ( !candidate.valid( ) ) return;
-		// A fleeting edge contact need not leave a last-landed record. The ray
-		// hint seeds trials only; airborne contact/velocity are verified below.
-		const auto contact_when = baseline.landed ? baseline.landing_when : this->m_hint_when;
+		const auto& prestate = systems::g_prediction.pre( );
+		const auto minimum_speed = std::max( prestate.velocity.length_2d( ), baseline.speed );
 		const auto gravity = CONVAR( "sv_gravity" );
 		if ( !gravity ) return;
-		const auto scale = memory::read<float>( local.pawn + SCHEMA( "C_BaseEntity", "m_flGravityScale"_hash ) );
-		const auto gravity_step = gravity->get<float>( ) * scale * cstypes::tick_interval;
+		const auto gravity_scale = memory::read<float>( local.pawn + SCHEMA( "C_BaseEntity", "m_flGravityScale"_hash ) );
+		const auto gravity_step = gravity->get<float>( ) * gravity_scale * cstypes::tick_interval;
 		if ( !std::isfinite( gravity_step ) || gravity_step <= 0.0f ) return;
+		landing::transaction candidate{ cmd, this->m_needed };
+		if ( !candidate.valid( ) ) return;
 		const auto apply = [ & ]( float when )
 		{
 			candidate.reset( );
 			const auto seg = when / static_cast<float>( this->m_passes );
-			int index = 0;
 			for ( int p = 0; p < this->m_passes; ++p )
 			{
-				landing::set_event( candidate.event( index++ ), landing::duck, true, seg * p );
-				landing::set_event( candidate.event( index++ ), landing::duck, false, seg * ( p + 1 ) );
+				landing::set_event( candidate.event( p * 2 ), landing::duck, true, seg * static_cast<float>( p ) );
+				landing::set_event( candidate.event( p * 2 + 1 ), landing::duck, false, seg * static_cast<float>( p + 1 ) );
 			}
-			// Edge trials never jump; jumpbug owns the fallback if no edge works.
-			landing::set_event( candidate.event( index ), landing::jump, false, 0.0f );
-			cmd->buttons.value &= ~( landing::duck | landing::jump );
-			cmd->buttons.value_changed |= landing::duck | landing::jump;
-			cmd->buttons.value_scroll &= ~( landing::duck | landing::jump );
+			if ( this->m_include_jump )
+			{
+				landing::set_event( candidate.event( this->m_passes * 2 ), landing::jump, false, when );
+				landing::set_event( candidate.event( this->m_passes * 2 + 1 ), landing::jump, true, when );
+			}
 			candidate.encode_angles( );
 		};
-		float best_when = -1.0f;
-		float best_speed = -1.0f;
-		for ( const float offset : { 0.0f, landing::time_step, -landing::time_step } )
+		const auto accept = [ & ]( const landing::result& trial, float when )
 		{
-			const auto when = std::clamp( contact_when + offset, landing::time_step, 1.0f - landing::time_step );
-			apply( when );
-			const auto trial = landing::predict( cmd, local );
-			if ( !trial.valid || ( trial.flags & cstypes::entity_flags::on_ground )
-				|| trial.speed + landing::speed_tolerance < baseline.speed ) continue;
-			// A real contact interrupts the downward trajectory. Accept the
-			// remaining sub-frame gravity range, not a magic fixed -6.25 Z.
-			if ( trial.jumped || trial.velocity.z > 0.0f || trial.velocity.z < -gravity_step - 1.0f
-				|| trial.velocity.z <= systems::g_prediction.pre( ).velocity.z + 1.0f ) continue;
-			if ( trial.speed > best_speed ) { best_when = when; best_speed = trial.speed; }
-		}
-		if ( best_when < 0.0f ) return;
-		apply( best_when );
+			return ( this->m_include_jump && landing::clean_jump( trial, when, minimum_speed ) )
+				|| landing::clean_edge( trial, minimum_speed, prestate.velocity.z, gravity_step );
+		};
+		if ( !landing::find_timing( cmd, local, this->m_landing_fraction, this->m_passes == 1, apply, accept ) ) return;
 		candidate.commit( );
 		this->m_active_this_tick = true;
 	}
@@ -171,11 +247,6 @@ namespace features::movement {
 	void edgebug::on_render( xdraw::draw_list& draw_list )
 	{
 		( void )draw_list;
-
-		if ( !settings::g_movement.landing_assist.value )
-		{
-			return;
-		}
 	}
 
 } // namespace features::movement

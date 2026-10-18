@@ -26,6 +26,25 @@ namespace rendering {
 			return out;
 		}
 
+		// 配置名以宽字符存储在 config 注册表，顶栏下拉需要 UTF-8 窄字符串。
+		[[nodiscard]] static std::string to_utf8( const std::wstring& wide )
+		{
+			if ( wide.empty( ) )
+			{
+				return {};
+			}
+
+			const auto needed = WideCharToMultiByte( CP_UTF8, 0, wide.c_str( ), static_cast< int >( wide.size( ) ), nullptr, 0, nullptr, nullptr );
+			if ( needed <= 0 )
+			{
+				return {};
+			}
+
+			std::string out( static_cast< std::size_t >( needed ), '\0' );
+			WideCharToMultiByte( CP_UTF8, 0, wide.c_str( ), static_cast< int >( wide.size( ) ), out.data( ), needed, nullptr, nullptr );
+			return out;
+		}
+
 		// 订阅到期标签：日期来自账号快照（注入器共享内存 + 周期复验），
 		// 空数据显示占位。前缀走 xui 翻译（"expires"→"到期"）。
 		[[nodiscard]] static std::string subscription_label( )
@@ -178,7 +197,7 @@ namespace rendering {
 		this->m_textures.cfg_plus.resource = xdraw::load_svg( svgs::cfg_plus, 1.0f, &this->m_textures.cfg_plus.width, &this->m_textures.cfg_plus.height );
 
 		constexpr auto tab_target{ 22.0f };
-		constexpr std::array<const char*, 8> tab_svgs{
+		constexpr std::array<const char*, static_cast< std::size_t >( tab::count )> tab_svgs{
 			svgs::tab_rage,
 			svgs::tab_legit,
 			svgs::tab_player,
@@ -188,7 +207,7 @@ namespace rendering {
 			svgs::tab_config,
 			svgs::tab_script
 		};
-		for ( auto i = 0; i < 8; ++i )
+		for ( auto i = 0; i < static_cast< int >( tab::count ); ++i )
 		{
 			this->m_textures.tabs[ i ].resource = xdraw::load_svg( tab_svgs[ i ], tab_target / 24.0f, &this->m_textures.tabs[ i ].width, &this->m_textures.tabs[ i ].height );
 		}
@@ -702,17 +721,12 @@ namespace rendering {
 			const auto content_w = ww - tokens::gap * 2.0f - sb_w - tokens::gap;
 			const auto content_h = sb_h;
 
-			if ( !this->m_profile_page )
-			{
-				this->draw_top_bar( content_w );
-			}
+			this->draw_top_bar( content_w );
 
-			const auto body_y = this->m_profile_page ? content_y : content_y + tokens::subtab_bar_h + tokens::gap;
-			const auto body_h = this->m_profile_page ? content_h : content_h - tokens::subtab_bar_h - tokens::gap;
+			const auto body_y = content_y + tokens::subtab_bar_h + tokens::gap;
+			const auto body_h = content_h - tokens::subtab_bar_h - tokens::gap;
 			const auto col_w = ( content_w - tokens::gap ) * 0.5f;
 
-			const auto left_x = content_x;
-			const auto right_x = content_x + col_w + tokens::gap;
 			this->m_body_x = content_x;
 			this->m_body_y = body_y;
 			this->m_body_w = content_w;
@@ -819,16 +833,28 @@ namespace rendering {
 			dl.text( pill_x + 12.0f, pill_y + 29.0f, "Counter-Strike 2", tokens::col_text.alpha( 175 ) );
 		}
 
-		constexpr auto tab_count{ 8 };
+		constexpr auto tab_count{ static_cast< int >( tab::count ) };
 		constexpr const char* tab_names[ tab_count ]{ "rage", "legit", "players", "world", "skins", "misc", "configs", "scripts" };
 		const auto icon_pad{ 4.0f };
-		const auto icon_stride = tokens::tab_icon_size + 4.0f;
+		const auto tabs_top = tabs_y + icon_pad;
+
+		// 子标签嵌在当前主标签下方（截图样式）：先按总行数把行高收进可用高度，避免压到资料卡。
+		const auto profile_h = 58.0f;
+		const auto profile_x = sb_x + 4.0f;
+		const auto profile_y = this->m_y + tokens::gap + header_h + h - profile_h - 6.0f;
+		const auto tabs_avail = std::max( 0.0f, profile_y - 6.0f - tabs_top );
+		const auto active_subs = ( !this->m_profile_page && this->m_tab >= 0 && this->m_tab < tab_count ) ? k_subtab_defs[ this->m_tab ].count : 0;
+		const auto row_units = static_cast< float >( tab_count ) + static_cast< float >( active_subs ) * 0.75f;
+		const auto row_h = std::clamp( tabs_avail / std::max( 1.0f, row_units ), 28.0f, tokens::tab_icon_size + 4.0f );
+		const auto sub_row_h = row_h * 0.75f;
+		constexpr auto sub_indent{ 26.0f };
+
+		auto row_y = tabs_top;
 
 		for ( auto i = 0; i < tab_count; ++i )
 		{
 			const auto ix = sb_x + 4.0f;
-			const auto iy = tabs_y + icon_pad + i * icon_stride;
-			const auto btn = xui::rect{ ix, iy, tokens::sidebar_w - 8.0f, tokens::tab_icon_size };
+			const auto btn = xui::rect{ ix, row_y, tokens::sidebar_w - 8.0f, row_h };
 
 			const auto hovered = input.in_rect( btn );
 			const auto is_active = !this->m_profile_page && ( this->m_tab == i );
@@ -874,12 +900,54 @@ namespace rendering {
 			const auto label_h = xdraw::measure_text( label ).second;
 			const auto label_col = is_active ? xui::lerp( tokens::col_text, tokens::col_dark, active_anim ) : xui::lerp( tokens::col_text_dim, tokens::col_text, hover_anim );
 			dl.text( btn.x + tokens::tab_icon_size + 4.0f, btn.y + ( btn.h - label_h ) * 0.5f, label, label_col );
+
+			row_y += row_h;
+
+			const auto& def = k_subtab_defs[ i ];
+
+			if ( !is_active || def.count <= 0 )
+			{
+				continue;
+			}
+
+			for ( auto j = 0; j < def.count; ++j )
+			{
+				const auto sub_btn = xui::rect{ ix + sub_indent, row_y, tokens::sidebar_w - 8.0f - sub_indent, sub_row_h };
+				const auto sub_hovered = input.in_rect( sub_btn );
+				const auto sub_active = ( this->m_subtab == j );
+
+				if ( !this->m_search_open && sub_hovered && input.mouse_clicked && !xui::ctx( ).overlay_blocking( ) )
+				{
+					this->m_subtab = j;
+				}
+
+				const auto sub_hover_anim = xui::anim::lerp( xui::fnv1a( "sidebar_sub" ) + i * 8 + j, sub_hovered ? 1.0f : 0.0f, 12.0f );
+				const auto sub_active_anim = xui::anim::lerp( xui::fnv1a( "sidebar_sub_active" ) + i * 8 + j, sub_active ? 1.0f : 0.0f, 10.0f );
+
+				if ( sub_active_anim > 0.01f )
+				{
+					dl.rect_filled( sub_btn.x, sub_btn.y, sub_btn.w, sub_btn.h, tokens::col_accent.alpha( static_cast< std::uint8_t >( 46.0f * sub_active_anim ) ), xdraw::corner_radius{ tokens::btn_rounding } );
+				}
+				else if ( sub_hover_anim > 0.01f )
+				{
+					dl.rect_filled( sub_btn.x, sub_btn.y, sub_btn.w, sub_btn.h, tokens::col_elevated.alpha( static_cast< std::uint8_t >( 70.0f * sub_hover_anim ) ), xdraw::corner_radius{ tokens::btn_rounding } );
+				}
+
+				const auto sub_label = xui::translate( def.names[ j ] );
+				const auto sub_label_h = xdraw::measure_text( sub_label ).second;
+				const auto sub_col = sub_active
+					? xui::lerp( tokens::col_text_dim, tokens::col_accent, sub_active_anim )
+					: xui::lerp( tokens::col_text_dim, tokens::col_text, sub_hover_anim );
+				dl.text( sub_btn.x + 12.0f, sub_btn.y + ( sub_btn.h - sub_label_h ) * 0.5f, sub_label, sub_col );
+
+				row_y += sub_row_h;
+			}
+
+			row_y += 4.0f;
 		}
 
-		// Keep the profile card's interaction target stable until account data is available.
-		const auto profile_h = 58.0f;
-		const auto profile_x = sb_x + 4.0f;
-		const auto profile_y = this->m_y + tokens::gap + header_h + h - profile_h - 6.0f;
+		// 资料卡：头像圆盘 + 昵称 + 订阅到期（截图样式）。账号数据未就绪时退化为占位。
+		// 卡片背景仍由 button 绘制，同时保留点击进入资料页的交互。
 		xui::layout::set_cursor( profile_x - this->m_x, profile_y - this->m_y );
 		if ( xui::button( "##profile_card", tokens::sidebar_w - 8.0f, profile_h ) )
 		{
@@ -887,7 +955,32 @@ namespace rendering {
 			this->m_search_open = false;
 		}
 
-		dl.text( profile_x + 12.0f, profile_y + 21.0f, detail::subscription_label( ), tokens::col_text_dim );
+		const auto account_data = systems::g_account.get( );
+		const auto has_account = !account_data.username.empty( );
+		const auto avatar_cx = profile_x + 16.0f + 14.0f;
+		const auto avatar_cy = profile_y + profile_h * 0.5f;
+
+		dl.circle_filled( avatar_cx, avatar_cy, 14.0f, tokens::col_accent.alpha( 60 ) );
+		dl.circle_filled( avatar_cx, avatar_cy, 12.0f, tokens::col_elevated.alpha( 200 ) );
+
+		{
+			const auto initial = has_account ? account_data.username.substr( 0, 1 ) : std::string{ "?" };
+			const auto [ iw, ih ] = xdraw::measure_text( initial );
+			dl.text( std::floor( avatar_cx - iw * 0.5f ), std::floor( avatar_cy - ih * 0.5f ), initial, tokens::col_text );
+		}
+
+		const auto name_x = profile_x + 16.0f + 28.0f + 8.0f;
+		const auto name_w = profile_x + tokens::sidebar_w - 30.0f - name_x;
+		const std::string user_label = has_account ? account_data.username : std::string{ "--" };
+		const std::string_view user_name = xui::truncate( user_label, std::max( 24.0f, name_w ) );
+		const auto [ uw, uh ] = xdraw::measure_text( user_name );
+		const std::string sub_label = detail::subscription_label( );
+		const std::string_view sub_text = xui::truncate( sub_label, std::max( 24.0f, name_w ) );
+		const auto [ sw2, sh2 ] = xdraw::measure_text( sub_text );
+		const auto text_block_h = uh + 3.0f + sh2;
+
+		dl.text( name_x, std::floor( profile_y + ( profile_h - text_block_h ) * 0.5f ), user_name, tokens::col_text );
+		dl.text( name_x, std::floor( profile_y + ( profile_h - text_block_h ) * 0.5f + uh + 3.0f ), sub_text, tokens::col_text_dim );
 
 		const auto chevron_x = profile_x + tokens::sidebar_w - 25.0f;
 		const auto chevron_y = profile_y + profile_h * 0.5f;
@@ -1017,56 +1110,6 @@ namespace rendering {
 		}
 	}
 
-	void menu::draw_theme_swatches( float sb_x, float avatar_y )
-	{
-		if ( this->m_search_open )
-		{
-			return;
-		}
-
-		auto& dl = xui::draw::current( );
-		const auto& input = xui::ctx( ).input;
-
-		static constexpr xdraw::color k_preset_colors[ 5 ]
-		{
-			xdraw::color{ 255, 126, 156, 255 },
-			xdraw::color{ 190, 164, 255, 255 },
-			xdraw::color{ 122, 224, 181, 255 },
-			xdraw::color{ 255, 171, 112, 255 },
-			xdraw::color{ 210, 214, 224, 255 },
-		};
-
-		constexpr auto swatch_count{ 5 };
-		constexpr auto dot_d{ 6.0f };
-		constexpr auto dot_gap{ 3.0f };
-		const auto block_h = swatch_count * dot_d + ( swatch_count - 1 ) * dot_gap;
-		const auto swatch_y = avatar_y - block_h - 10.0f;
-		const auto cx = sb_x + tokens::sidebar_w * 0.5f;
-
-		for ( auto i = 0; i < swatch_count; ++i )
-		{
-			const auto dot_y = swatch_y + static_cast< float >( i ) * ( dot_d + dot_gap );
-			const auto hit = xui::rect{ cx - dot_d * 0.5f - 2.0f, dot_y - 2.0f, dot_d + 4.0f, dot_d + 4.0f };
-			const auto hovered = input.in_rect( hit );
-			const auto is_active = ( this->m_theme_preset == i );
-			const auto hover_anim = xui::anim::lerp( xui::fnv1a( "theme_swatch" ) + i, ( hovered || is_active ) ? 1.0f : 0.0f, 14.0f );
-			const auto radius = dot_d * 0.5f + hover_anim * 0.75f;
-			const auto cy = dot_y + dot_d * 0.5f;
-
-			if ( is_active )
-			{
-				dl.circle_filled( cx, cy, radius + 1.5f, tokens::col_text.alpha( 200 ) );
-			}
-
-			dl.circle_filled( cx, cy, radius, k_preset_colors[ i ] );
-
-			if ( !xui::ctx( ).overlay_blocking( ) && hovered && input.mouse_clicked )
-			{
-				this->apply_theme_preset( i );
-			}
-		}
-	}
-
 	void menu::apply_theme_preset( int preset )
 	{
 		this->m_theme_preset = std::clamp( preset, 0, 4 );
@@ -1161,173 +1204,116 @@ namespace rendering {
 	{
 		auto& dl = xui::draw::current( );
 		const auto& input = xui::ctx( ).input;
+		const auto& style = xui::ctx( ).style;
 
 		const auto content_x = this->m_x + tokens::gap + tokens::sidebar_w + tokens::gap;
 		const auto bar_y = this->m_y + tokens::gap;
+		const auto bar_h = tokens::subtab_bar_h;
+		constexpr auto inner_pad{ 4.0f };
+		const auto field_y = bar_y + inner_pad;
+		const auto field_h = bar_h - inner_pad * 2.0f;
 
-		const auto& def = k_subtab_defs[ this->m_tab ];
-		const auto subtab_count = def.count;
+		dl.rect_filled( content_x, bar_y, w, bar_h, tokens::col_card, xdraw::corner_radius{ tokens::card_rounding } );
 
-		const auto inner_pad{ 4.0f };
-		const auto subtab_h = tokens::subtab_bar_h - inner_pad * 2.0f;
-		const auto util_w = inner_pad + subtab_h + inner_pad;
-		const auto search_anim = xui::anim::lerp( xui::fnv1a( "menu_topbar_search_anim" ), this->m_search_open ? 1.0f : 0.0f, 18.0f );
-		const auto normal_interactive = search_anim < 0.03f;
-
-		const auto subtabs_w = w - util_w - tokens::gap;
-		const auto btn_w = subtab_count > 0 ? ( subtabs_w - inner_pad * 2.0f ) / static_cast< float >( subtab_count ) : 0.0f;
-
-		if ( subtab_count > 0 )
+		// 顶栏右侧配置下拉与配置页共用 detail::config_list / detail::selected，两边保持一致。
+		if ( detail::needs_refresh )
 		{
-			dl.rect_filled( content_x, bar_y, subtabs_w, tokens::subtab_bar_h, tokens::col_card, xdraw::corner_radius{ tokens::card_rounding } );
-			dl.rect_filled( content_x + subtabs_w + tokens::gap, bar_y, util_w, tokens::subtab_bar_h, tokens::col_card, xdraw::corner_radius{ tokens::card_rounding } );
-		}
+			detail::config_list = config::registry::list( );
+			detail::needs_refresh = false;
+			this->m_config_items_dirty = true;
 
-		const auto by = bar_y + ( tokens::subtab_bar_h - subtab_h ) * 0.5f;
-		const auto pill_target_offset_x = inner_pad + btn_w * static_cast< float >( this->m_subtab );
-
-		if ( this->m_subtab_pill_tab != this->m_tab || this->m_subtab_pill_offset_x < 0.0f )
-		{
-			this->m_subtab_pill_offset_x = pill_target_offset_x;
-			this->m_subtab_pill_tab = this->m_tab;
-		}
-		else
-		{
-			const auto dt = xdraw::delta_time( );
-			this->m_subtab_pill_offset_x += ( pill_target_offset_x - this->m_subtab_pill_offset_x ) * std::min( 18.0f * dt, 1.0f );
-		}
-
-		if ( subtab_count > 0 )
-		{
-			dl.rect_filled( content_x + this->m_subtab_pill_offset_x, by, btn_w, subtab_h, tokens::col_accent, xdraw::corner_radius{ tokens::btn_rounding } );
-		}
-
-		for ( auto i = 0; i < subtab_count; ++i )
-		{
-			const auto bx = content_x + inner_pad + btn_w * i;
-			const auto btn = xui::rect{ bx, by, btn_w, subtab_h };
-
-			const auto hovered = input.in_rect( btn );
-			const auto is_active = ( this->m_subtab == i );
-
-			if ( normal_interactive && hovered && input.mouse_clicked && !xui::ctx( ).overlay_blocking( ) )
+			if ( detail::selected >= static_cast< int >( detail::config_list.size( ) ) )
 			{
-				this->m_subtab = i;
+				detail::selected = -1;
+			}
+		}
+
+		if ( this->m_config_items_dirty )
+		{
+			this->m_config_names.clear( );
+			this->m_config_items.clear( );
+			this->m_config_names.reserve( detail::config_list.size( ) );
+
+			for ( const auto& name : detail::config_list )
+			{
+				this->m_config_names.emplace_back( detail::to_utf8( name ) );
 			}
 
-			const auto active_anim = xui::anim::lerp( xui::fnv1a( "subtab_text" ) + i, is_active ? 1.0f : 0.0f, 12.0f );
-			const auto hover_anim = xui::anim::lerp( xui::fnv1a( "subtab_hover" ) + i, hovered && !is_active ? 1.0f : 0.0f, 14.0f );
+			this->m_config_items.reserve( this->m_config_names.size( ) );
 
-			if ( hover_anim > 0.01f )
+			for ( const auto& name : this->m_config_names )
 			{
-				dl.rect_filled( btn.x, btn.y, btn.w, btn.h, tokens::col_elevated.alpha( static_cast< std::uint8_t >( 90.0f * hover_anim ) ), xdraw::corner_radius{ tokens::btn_rounding } );
+				this->m_config_items.emplace_back( name.c_str( ) );
 			}
 
-			const auto subtab_name = xui::translate( def.names[ i ] );
-			const auto [tw, th] = xdraw::measure_text( subtab_name );
-			const auto tx = std::floor( btn.x + ( btn.w - tw ) * 0.5f );
-			const auto ty = std::floor( btn.y + ( btn.h - th ) * 0.5f );
-
-			auto text_col = xui::lerp( tokens::col_text_dim, tokens::col_dark, active_anim );
-			text_col = xui::lerp( text_col, tokens::col_text, hover_anim * 0.35f );
-			dl.text( tx, ty, subtab_name, text_col );
+			this->m_config_items_dirty = false;
 		}
 
-		const auto util_x = content_x + subtabs_w + tokens::gap;
+		constexpr auto save_w{ 72.0f };
+		const auto save_x = content_x + w - inner_pad - save_w;
+		const auto combo_w = std::clamp( w * 0.2f, 96.0f, 170.0f );
+		const auto combo_x = save_x - tokens::gap - combo_w;
+		const auto field_x = content_x + inner_pad;
+		const auto field_w = std::max( 120.0f, combo_x - tokens::gap - field_x );
 
+		dl.rect_filled( field_x, field_y, field_w, field_h, tokens::col_elevated.alpha( 110 ), xdraw::corner_radius{ tokens::btn_rounding } );
+
+		if ( this->m_textures.search.resource )
 		{
-			const auto bx = util_x + inner_pad;
-			const auto by = bar_y + ( tokens::subtab_bar_h - subtab_h ) * 0.5f;
-			const auto btn = xui::rect{ bx, by, subtab_h, subtab_h };
-			const auto hovered = input.in_rect( btn );
-			const auto hover_anim = xui::anim::lerp( xui::fnv1a( "menu_search_btn" ), hovered ? 1.0f : 0.0f, 14.0f );
-			if ( hover_anim > 0.01f )
-			{
-				dl.rect_filled( bx, by, subtab_h, subtab_h, tokens::col_card.alpha( static_cast< std::uint8_t >( 120.0f * hover_anim ) ), xdraw::corner_radius{ tokens::btn_rounding } );
-			}
+			const auto iw = static_cast< float >( this->m_textures.search.width );
+			const auto ih = static_cast< float >( this->m_textures.search.height );
+			dl.image( std::floor( field_x + 9.0f ), std::floor( field_y + ( field_h - ih ) * 0.5f ), iw, ih, this->m_textures.search.resource.Get( ), tokens::col_text_dim );
+		}
 
-			if ( this->m_textures.search.resource )
-			{
-				const auto iw = static_cast< float >( this->m_textures.search.width );
-				const auto ih = static_cast< float >( this->m_textures.search.height );
-				dl.image( std::floor( bx + ( subtab_h - iw ) * 0.5f ), std::floor( by + ( subtab_h - ih ) * 0.5f ), iw, ih, this->m_textures.search.resource.Get( ), xui::lerp( tokens::col_text_dim, tokens::col_text, hover_anim ) );
-			}
+		if ( auto* win = xui::layout::current_window( ) )
+		{
+			const auto saved_bounds = win->bounds;
+			const auto saved_cursor_x = win->cursor_x;
+			const auto saved_cursor_y = win->cursor_y;
+			const auto saved_line_h = win->line_h;
 
-			if ( normal_interactive && hovered && input.mouse_clicked && !xui::ctx( ).overlay_blocking( ) )
+			win->bounds.w = field_x - win->bounds.x + field_w + style.window_pad_x;
+			xui::layout::set_cursor( field_x - this->m_x, field_y - this->m_y );
+
+			xui::push_style_var( xui::style_var::text_input_h, field_h );
+			xui::push_style_var( xui::style_var::text_input_rounding, tokens::btn_rounding );
+			xui::push_style_var( xui::style_var::frame_pad_x, 26.0f );
+			xui::push_style_color( xui::style_col::text_input_bg, tokens::col_card.alpha( 0 ) );
+			xui::push_style_color( xui::style_col::text_input_border, tokens::col_card.alpha( 0 ) );
+
+			const auto typed = xui::text_input( "##menu_search_input", this->m_search_query, 96, "i want to find..." );
+
+			xui::pop_style_color( 2 );
+			xui::pop_style_var( 3 );
+
+			win->bounds = saved_bounds;
+			win->cursor_x = saved_cursor_x;
+			win->cursor_y = saved_cursor_y;
+			win->line_h = saved_line_h;
+
+			if ( typed && !this->m_search_query.empty( ) && !this->m_search_open )
 			{
 				this->m_search_open = true;
-				this->m_search_query.clear( );
 				this->rebuild_search_index( );
-				return;
 			}
 		}
 
-		if ( search_anim > 0.01f )
+		if ( this->m_search_open )
 		{
-			const auto t = search_anim * search_anim * ( 3.0f - 2.0f * search_anim );
-			const auto panel_w = std::lerp( util_w, w, t );
-			const auto panel_x = content_x + w - panel_w;
-			const auto panel_y = bar_y;
-			const auto panel_h = tokens::subtab_bar_h;
-			const auto panel_rounding = tokens::card_rounding;
-			const auto panel_alpha = static_cast< std::uint8_t >( std::clamp( 190.0f + 55.0f * t, 0.0f, 245.0f ) );
-
-			dl.rect_filled( panel_x, panel_y, panel_w, panel_h, tokens::col_dark.alpha( static_cast< std::uint8_t >( 225.0f * t ) ), xdraw::corner_radius{ panel_rounding } );
-			dl.rect_filled_blurred( panel_x, panel_y, panel_w, panel_h, xdraw::corner_radius{ panel_rounding }, xdraw::color{ 255, 255, 255, static_cast< std::uint8_t >( 130.0f * t ) } );
-			dl.rect_filled( panel_x, panel_y, panel_w, panel_h, tokens::col_elevated.alpha( panel_alpha ), xdraw::corner_radius{ panel_rounding } );
-
-			const auto close_w = subtab_h;
-			const auto close_x = panel_x + panel_w - inner_pad - close_w;
-			const auto close_y = bar_y + ( tokens::subtab_bar_h - subtab_h ) * 0.5f;
-			const auto close_rect = xui::rect{ close_x, close_y, close_w, subtab_h };
+			const auto close_w = field_h;
+			const auto close_x = field_x + field_w - inner_pad - close_w;
+			const auto close_rect = xui::rect{ close_x, field_y, close_w, field_h };
 			const auto close_hovered = input.in_rect( close_rect );
 			const auto close_anim = xui::anim::lerp( xui::fnv1a( "menu_search_close" ), close_hovered ? 1.0f : 0.0f, 14.0f );
-			const auto close_bg = xui::lerp( tokens::col_card.alpha( 0 ), tokens::col_accent.alpha( 80 ), close_anim );
 
-			if ( panel_w > util_w + 24.0f )
-			{
-				const auto input_pad = inner_pad + 8.0f;
-				const auto input_x = panel_x + input_pad;
-				const auto input_y = bar_y + ( tokens::subtab_bar_h - subtab_h ) * 0.5f;
-				const auto input_w = std::max( 24.0f, panel_w - input_pad - close_w - inner_pad * 2.0f );
-
-				dl.push_clip( panel_x + inner_pad, panel_y, panel_w - inner_pad * 2.0f, panel_h );
-
-				if ( auto* win = xui::layout::current_window( ) )
-				{
-					const auto saved_bounds = win->bounds;
-					const auto saved_cursor_x = win->cursor_x;
-					const auto saved_cursor_y = win->cursor_y;
-					const auto saved_line_h = win->line_h;
-
-					win->bounds.w = input_x - win->bounds.x + input_w + xui::ctx( ).style.window_pad_x;
-					xui::layout::set_cursor( input_x - this->m_x, input_y - this->m_y );
-
-					xui::push_style_var( xui::style_var::text_input_h, subtab_h );
-					xui::push_style_var( xui::style_var::text_input_rounding, tokens::btn_rounding );
-					xui::push_style_color( xui::style_col::text_input_bg, tokens::col_card.alpha( 0 ) );
-					xui::push_style_color( xui::style_col::text_input_border, tokens::col_card.alpha( 0 ) );
-					xui::text_input( "##menu_search_input", this->m_search_query, 96, "i want to find..." );
-					xui::pop_style_color( 2 );
-					xui::pop_style_var( 2 );
-
-					win->bounds = saved_bounds;
-					win->cursor_x = saved_cursor_x;
-					win->cursor_y = saved_cursor_y;
-					win->line_h = saved_line_h;
-				}
-
-				dl.pop_clip( );
-			}
-
-			dl.rect_filled( close_x, close_y, close_w, subtab_h, close_bg, xdraw::corner_radius{ tokens::btn_rounding } );
+			dl.rect_filled( close_x, field_y, close_w, field_h, xui::lerp( tokens::col_card.alpha( 0 ), tokens::col_accent.alpha( 80 ), close_anim ), xdraw::corner_radius{ tokens::btn_rounding } );
 
 			const auto cx = close_x + close_w * 0.5f;
-			const auto cy = close_y + subtab_h * 0.5f;
-			const auto span = 4.0f;
-			auto x_col = xui::lerp( tokens::col_text_dim.alpha( static_cast< std::uint8_t >( 180.0f * t ) ), tokens::col_text, std::max( close_anim, t ) );
-			dl.line( cx - span, cy - span, cx + span, cy + span, x_col, 1.3f );
-			dl.line( cx - span, cy + span, cx + span, cy - span, x_col, 1.3f );
+			const auto cy = field_y + field_h * 0.5f;
+			constexpr auto span{ 4.0f };
+			const auto close_col = xui::lerp( tokens::col_text_dim, tokens::col_text, close_anim );
+			dl.line( cx - span, cy - span, cx + span, cy + span, close_col, 1.3f );
+			dl.line( cx - span, cy + span, cx + span, cy - span, close_col, 1.3f );
 
 			if ( close_hovered && input.mouse_clicked )
 			{
@@ -1341,6 +1327,44 @@ namespace rendering {
 					this->close_search( );
 					break;
 				}
+			}
+		}
+
+		const auto has_selection = detail::selected >= 0 && detail::selected < static_cast< int >( detail::config_list.size( ) );
+		const auto save_rect = xui::rect{ save_x, field_y, save_w, field_h };
+		const auto save_hovered = has_selection && input.in_rect( save_rect );
+		const auto save_anim = xui::anim::lerp( xui::fnv1a( "menu_topbar_save" ), save_hovered ? 1.0f : 0.0f, 14.0f );
+
+		auto save_bg = tokens::col_accent;
+		save_bg.a = has_selection ? static_cast< std::uint8_t >( 210.0f + 45.0f * save_anim ) : 60;
+		dl.rect_filled( save_x, field_y, save_w, field_h, save_bg, xdraw::corner_radius{ tokens::btn_rounding } );
+
+		const auto save_label = xui::translate( "save" );
+		const auto [ save_label_w, save_label_h ] = xdraw::measure_text( save_label );
+		dl.text(
+			std::floor( save_x + ( save_w - save_label_w ) * 0.5f ),
+			std::floor( field_y + ( field_h - save_label_h ) * 0.5f ),
+			save_label,
+			tokens::col_text.alpha( has_selection ? 255 : 140 ) );
+
+		if ( save_hovered && input.mouse_clicked && !xui::ctx( ).overlay_blocking( ) )
+		{
+			config::registry::save( detail::config_list[ detail::selected ] );
+			detail::needs_refresh = true;
+		}
+
+		if ( !this->m_config_items.empty( ) )
+		{
+			const auto label_h = xdraw::measure_text( "" ).second;
+			const auto combo_spacing = style.item_spacing_y * 0.25f;
+			const auto combo_y = field_y + ( field_h - style.combo_h ) * 0.5f - label_h - combo_spacing;
+
+			xui::layout::set_cursor( combo_x - this->m_x, combo_y - this->m_y );
+
+			if ( xui::combo( "##cfg_combo", detail::selected, this->m_config_items.data( ), static_cast< int >( this->m_config_items.size( ) ), combo_w ) && has_selection )
+			{
+				config::registry::load( detail::config_list[ detail::selected ] );
+				settings::finalize_binds( );
 			}
 		}
 	}

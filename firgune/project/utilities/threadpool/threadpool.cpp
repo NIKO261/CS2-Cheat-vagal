@@ -223,9 +223,11 @@ namespace threadpool {
 	}
 
 	void run_sync (std::function<void ()> func, job_priority priority) {
-		auto handle = run (std::move (func), priority);
+		auto handle = run (func, priority);
 		if (handle) {
 			handle.wait ();
+		} else {
+			func ();
 		}
 	}
 
@@ -249,14 +251,28 @@ namespace threadpool {
 			return;
 		}
 
-		std::vector<job> jobs;
-		jobs.reserve (static_cast<std::size_t>(num_chunks) - 1);
+		// Creation can fail (the engine job allocation has no failure path of its
+		// own). A chunk whose job could not be created must still run exactly
+		// once, so it is executed on the calling thread instead of being lost.
+		std::vector<std::function<void ()>> chunks;
+		chunks.reserve (static_cast<std::size_t>(num_chunks) - 1);
 
 		for (auto i = 0; i < num_chunks - 1; ++i) {
 			const auto cb {begin + i * chunk_size};
 			const auto ce {std::min (cb + chunk_size, end)};
+			chunks.push_back ([&body, cb, ce] () { body (cb, ce); });
+		}
 
-			jobs.push_back (run ([&body, cb, ce] () { body (cb, ce); }, priority));
+		std::vector<job> jobs;
+		jobs.reserve (chunks.size ());
+
+		for (auto& chunk : chunks) {
+			auto handle = run (chunk, priority);
+			if (handle) {
+				jobs.push_back (std::move (handle));
+			} else {
+				chunk ();
+			}
 		}
 
 		body (begin + (num_chunks - 1) * chunk_size, end);
@@ -275,7 +291,12 @@ namespace threadpool {
 		jobs.reserve (tasks.size ());
 
 		for (auto& task : tasks) {
-			jobs.push_back (run (std::move (task), priority));
+			auto handle = run (task, priority);
+			if (handle) {
+				jobs.push_back (std::move (handle));
+			} else {
+				task ();
+			}
 		}
 
 		for (auto& j : jobs) {

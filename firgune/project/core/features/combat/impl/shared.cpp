@@ -146,17 +146,52 @@ namespace features::combat {
 		return out;
 	}
 
-	float shared::calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples ) const
-	{
-		if ( samples <= 0 )
+	namespace {
+		constexpr int k_spread_cache_samples{ 1024 };
+
+		// The generated spread table depends only on the cone and weapon state, so
+		// one context serves every point of a scan. A coarse -> full upgrade only
+		// appends the missing suffix. Everything that changes the sequence is part
+		// of the key; a mismatch regenerates the table from scratch.
+		struct spread_cache
 		{
-			return 0.0f;
+			float inaccuracy{};
+			float spread{};
+			float recoil_index{};
+			int item_def_idx{};
+			int num_bullets{};
+			int weapon_mode{};
+			std::uint32_t weapon_type{};
+			int count{};
+			bool engine_valid{};
+			bool initialized{};
+			std::array<math::vector2, k_spread_cache_samples> values{};
+		};
+
+		thread_local spread_cache g_spread_cache{};
+	}
+
+	void shared::advance_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, hitchance_result& result, int target_samples ) const
+	{
+		if ( target_samples <= 0 )
+		{
+			result = {};
+			return;
 		}
+
+		// Asking for fewer samples than already evaluated starts a new evaluation
+		// instead of extending the old one.
+		if ( target_samples < result.evaluated ) result = {};
+		// Never shrink an already fixed budget: a later step extends the same plan.
+		if ( target_samples > result.planned ) result.planned = target_samples;
 
 		const auto cone = std::max( inaccuracy + spread, 0.0f );
 		if ( cone <= 0.000001f )
 		{
-			return 1.0f;
+			result.evaluated = result.planned;
+			result.hits = result.planned;
+			result.complete = true;
+			return;
 		}
 
 		const auto capsule_start = bone.rotation.rotate_vector( hitbox.mins ) + bone.position;
@@ -170,32 +205,24 @@ namespace features::combat {
 		math::vector3 forward{}, left{}, up{};
 		math::helpers::angle_vectors_left( aim_angle, &forward, &left, &up );
 
-		struct spread_cache
-		{
-			float inaccuracy{};
-			float spread{};
-			float recoil_index{};
-			int item_def_idx{};
-			int num_bullets{};
-			int weapon_mode{};
-			int count{};
-			bool engine_valid{};
-			bool initialized{};
-			std::array<math::vector2, 512> values{};
-		};
-
-		thread_local spread_cache cache{};
+		auto& cache = g_spread_cache;
 		const auto cache_changed = !cache.initialized || cache.inaccuracy != inaccuracy || cache.spread != spread ||
 			cache.recoil_index != this->m_ctx.recoil_index || cache.item_def_idx != this->m_ctx.item_def_idx ||
-			cache.num_bullets != this->m_ctx.num_bullets || cache.weapon_mode != this->m_ctx.weapon_mode;
+			cache.num_bullets != this->m_ctx.num_bullets || cache.weapon_mode != this->m_ctx.weapon_mode ||
+			cache.weapon_type != this->m_ctx.weapon_type;
 		if ( cache_changed )
 		{
+			// A context change invalidates every count derived from the old table.
+			result.hits = 0;
+			result.evaluated = 0;
+
 			cache.inaccuracy = inaccuracy;
 			cache.spread = spread;
 			cache.recoil_index = this->m_ctx.recoil_index;
 			cache.item_def_idx = this->m_ctx.item_def_idx;
 			cache.num_bullets = this->m_ctx.num_bullets;
 			cache.weapon_mode = this->m_ctx.weapon_mode;
+			cache.weapon_type = this->m_ctx.weapon_type;
 			cache.count = 0;
 			cache.engine_valid = true;
 			cache.initialized = true;
@@ -237,7 +264,7 @@ namespace features::combat {
 			return math::vector2{ std::cosf( theta ) * offset, std::sinf( theta ) * offset };
 		};
 
-		const auto cached_samples = std::min( samples, static_cast< int >( cache.values.size( ) ) );
+		const auto cached_samples = std::min( target_samples, k_spread_cache_samples );
 		for ( auto i = cache.count; i < cached_samples; ++i )
 		{
 			cache.values[ i ] = cache.engine_valid
@@ -252,9 +279,8 @@ namespace features::combat {
 		const auto max_ray_length = this->m_ctx.range >= 64.0f ? this->m_ctx.range : 8192.0f;
 		const auto ray_length = std::clamp( target_reach, 64.0f, max_ray_length );
 		const auto local_ray_start = inverse_rotation.rotate_vector( shoot_position - bone.position );
-		auto hits{ 0 };
 
-		for ( auto i = 0; i < samples; ++i )
+		for ( auto i = result.evaluated; i < target_samples; ++i )
 		{
 			const auto calculated_spread = i < cached_samples
 				? cache.values[ i ]
@@ -293,13 +319,18 @@ namespace features::combat {
 					intersect_axis( local_ray_start.z, local_delta.z, hitbox.mins.z, hitbox.maxs.z );
 			}
 
-			if ( hit )
-			{
-				++hits;
-			}
+			if ( hit ) ++result.hits;
 		}
 
-		return static_cast< float >( hits ) / static_cast< float >( samples );
+		result.evaluated = target_samples;
+		result.complete = result.evaluated >= result.planned;
+	}
+
+	float shared::calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples ) const
+	{
+		hitchance_result result{};
+		this->advance_hitchance( shoot_position, aim_angle, hitbox, bone, inaccuracy, spread, result, samples );
+		return result.value( );
 	}
 
 	std::optional<math::vector3> shared::find_spread_correction( const math::vector3& aim_angle, int tick, const math::vector3& punch, const shot_spread_state& state ) const

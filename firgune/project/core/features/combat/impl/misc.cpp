@@ -799,69 +799,48 @@ namespace features::combat {
 
 	void misc::duckpeek::on_create_move( systems::input::usercmd* cmd )
 	{
-		this->m_fake_stand_active = false;
-
 		if ( !cmd || !settings::g_combat.m_duckpeek.enabled.value )
 		{
-			this->m_was_active = false;
 			return;
 		}
 
 		const auto local = systems::g_local.get( );
 		if ( !local.is_alive || !local.pawn || systems::g_local.is_in_cinematic( ) || systems::g_local.is_in_time_freeze( ) )
 		{
-			this->m_was_active = false;
 			return;
 		}
 
-		this->m_was_active = true;
-
 		if ( g_rage.should_release_duck_for_shot( ) )
 		{
-			// Release duck AND force immediate unduck: in CS2 simply releasing
-			// the button still takes ~0.4s for the animation to complete. Writing
-			// duck amount to 0.0f instantly sets the player to standing posture.
+			// Let native movement update posture, collision and view height together.
+			// Direct duck-amount writes are corrected by prediction/server state.
 			cmd->buttons.value &= ~cstypes::command_buttons::in_duck;
 			cmd->buttons.value_changed &= ~cstypes::command_buttons::in_duck;
 			cmd->buttons.value_scroll &= ~cstypes::command_buttons::in_duck;
-			this->m_fake_stand_active = true;
-
-			// Immediate posture recovery: zero duck amount = standing height now.
-			// m_bDesiresDuck must be cleared too - otherwise the next movement
-			// simulation tick sees "duck desired" and re-crouches, undoing this.
-			const auto movement_services = memory::read<std::uintptr_t>( local.pawn
-				+ SCHEMA( "C_BasePlayerPawn", "m_pMovementServices"_hash ) );
-			if ( movement_services )
-			{
-				memory::write<float>( movement_services
-					+ SCHEMA( "CCSPlayer_MovementServices", "m_flDuckAmount"_hash ), 0.0f );
-				memory::write<bool>( movement_services
-					+ SCHEMA( "CCSPlayer_MovementServices", "m_bDesiresDuck"_hash ), false );
-			}
 			return;
 		}
 
 		cmd->buttons.value |= cstypes::command_buttons::in_duck;
 		cmd->buttons.value_changed |= cstypes::command_buttons::in_duck;
 		cmd->buttons.value_scroll &= ~cstypes::command_buttons::in_duck;
-
-		if ( g_rage.duckpeek_wants_reduck( ) )
-		{
-			g_rage.clear_duckpeek_reduck( );
-		}
 	}
 
 	void misc::duckpeek::on_override_view( std::uintptr_t view_setup )
 	{
 		if ( !settings::g_combat.m_duckpeek.enabled.value || !view_setup )
 		{
-			this->m_was_active = false;
-			this->m_fake_stand_active = false;
 			return;
 		}
 
 		const auto local = systems::g_local.get( );
-		if ( !local.is_alive || !local.pawn || systems::g_local.is_in_cinematic( ) )
+		if ( !local.is_alive || !local.pawn || systems::g_local.is_in_cinematic( ) || systems::g_local.is_in_time_freeze( ) )
+		{
+			return;
+		}
+
+		// Third person already follows the native eye and resolves wall collision.
+		// A late height offset disagrees with that eye during duck transitions.
+		if ( settings::g_misc.m_camera.thirdperson.value )
 		{
 			return;
 		}

@@ -14,9 +14,9 @@ namespace patterns {
 	SDK_PATTERN( add_entity, "client.dll:48 89 74 24 ?? 57 48 83 EC ?? 41 B9 ?? ?? ?? ?? 41 8B C0 41 23 C1 48 8B F2 41 83 F8 ?? 48 8B F9 44 0F 45 C8 41 81 F9 ?? ?? ?? ?? 73 ?? FF 81" );
 	SDK_PATTERN( base_fire_guns_get_inaccuracy, "client.dll:> E8 ?? ?? ?? ?? 84 C0 0F 84 C6 FE FF FF" );
 	SDK_PATTERN( button_state_alloc, "client.dll:48 8B 54 CA 08 8D 41 01 89 47 08 EB 16 48 8B 0F > E8 ?? ?? ?? ?? 48 8B D0 48 8B CF -80" );
-	SDK_PATTERN( create_move, "client.dll:48 8B C4 4C 89 40 18 48 89 48 08 55 53 57 41 55 48 8D A8 08 FF FF FF 48 81 EC D8 01 00 00 48 89 70 10" );
+	SDK_PATTERN( create_move, "client.dll:48 8B C4 4C 89 40 ?? 48 89 48 ?? 55 53 57" );
 	SDK_PATTERN( draw_flash_effect, "client.dll:85 D2 0F 88 ?? ?? ?? ?? 48 89 4C 24 ?? 55 56" );
-	SDK_PATTERN( draw_legs, "client.dll:4C 8B DC 55 53 56 57 41 57" );
+	SDK_PATTERN( draw_legs, "client.dll:4C 8B DC 55 53 56 57 41 56" );
 	SDK_PATTERN( draw_overhead, "client.dll:40 53 48 83 EC ?? 48 8B D9 83 FA ?? 75" );
 	SDK_PATTERN( dynamic_light_alloc, "client.dll:48 8B D9 45 33 C0 48 8B 0D ?? ?? ?? ?? BA 01 00 00 00 > E8 ?? ?? ?? ?? 8B 0B" );
 	SDK_PATTERN( dynamic_light_manager, "client.dll:48 8B D9 45 33 C0 48 8B 0D * ?? ?? ?? ?? BA 01 00 00 00 E8 ?? ?? ?? ?? 8B 0B" );
@@ -26,7 +26,7 @@ namespace patterns {
 	SDK_PATTERN( econ_item_view_set_attribute, "client.dll:40 53 48 83 EC 20 48 8B D9 48 81 C1 08 02 00 00" );
 	SDK_PATTERN( entity_list, "client.dll:48 8B 0D * ?? ?? ?? ?? 8B FB C1 EB 0E" );
 	SDK_PATTERN( find_hud_element, "client.dll:40 53 48 83 EC ?? 48 8B 05 ?? ?? ?? ?? 48 8B D9 48 85 C0 74 ?? 48 89 5C 24" );
-	SDK_PATTERN( frame_stage_notify, "client.dll:48 89 5C 24 18 48 89 6C 24 20 57 48 83 EC 40 48 8B F9 33 ED 48 8B 89 60 04 00 00 8B DA 48 85 C9" );
+	SDK_PATTERN( frame_stage_notify, "client.dll:48 89 5C 24 ?? 48 89 6C 24 ?? 57 48 83 EC ?? 48 8B F9 33 ED 48 8B 89" );
 	SDK_PATTERN( game_event_get_controller, "client.dll:48 83 EC 38 8B 02 4C 8D 44 24 20" );
 	SDK_PATTERN( game_event_get_float, "client.dll:> E8 ?? ?? ?? ?? 0F 28 D8 89 5C 24 20" );
 	SDK_PATTERN( game_event_get_int, "client.dll:> E8 ?? ?? ?? ?? 3D 00 80 00 00" );
@@ -52,7 +52,7 @@ namespace patterns {
 	SDK_PATTERN( get_viewmodel_offsets, "client.dll:40 55 53 56 41 56 41 57 48 8B EC 48 83 EC 20 4D 8B F8 4C 8B F2 48 8B F1 E8" );
 	SDK_PATTERN( get_world_group_handle, "client.dll:> E8 ?? ?? ?? ?? 41 8B 5F 10" );
 	SDK_PATTERN( get_world_group_id, "client.dll:48 8B 41 30 48 85 C0 74 0D 48 8B 40 10 8B" );
-	SDK_PATTERN( handle_view_angles, "client.dll:40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 33 C0 C6 83 BD 0B 00 00 00 48 C7 83 C0 0B 00 00 FF FF FF FF" );
+	SDK_PATTERN( handle_view_angles, "client.dll:40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 33 C0 C6 83 BD 0B 00 00 00 48 C7 83 CC 0B 00 00 FF FF FF FF" );
 	SDK_PATTERN( history_field_alloc, "client.dll:> E8 ?? ?? ?? ?? 48 8B D0 48 8D 4E 28" );
 	SDK_PATTERN( hud, "client.dll:48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 70 F3 FF FF 48 81 EC 90 0D 00 00 81 A5 DC 0C 00 00 FF FF 0F FF 33 F6 8B 5A 6C 48 8B" );
 	SDK_PATTERN( hud_death_notice_clear, "client.dll:85 C0 75 09 48 8D 4E E0 > E8 ?? ?? ?? ?? 48 8B 5C 24 40" );
@@ -65,14 +65,15 @@ namespace patterns {
 	SDK_PATTERN( level_shutdown, "client.dll:48 89 74 24 10 57 48 83 EC 20 48 8B F9 E8 ?? ?? ?? ?? 48 8D 8F 18 01 00 00 33 F6 48 8D 41 1C 41 B8 07 00 00 00" );
 	SDK_PATTERN( main_menu_panel, "client.dll:48 83 EC 28 48 8B 05 * ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 48 8B 48 08" );
 	SDK_PATTERN( material_manager, "client.dll:48 8B 0D * ?? ?? ?? ?? 80 A5 E7 00 00 00 EF" );
-	SDK_PATTERN( override_view, "client.dll:40 53 57 48 83 EC 58 48 8B FA E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 80 78 58 00 0F 84 ?? ?? ?? ??" );
-	SDK_PATTERN( parse_report_hit, "client.dll:48 89 5C 24 18 48 89 74 24 20 57 48 83 EC 20 48 8D 05 B2 42 59 01 8B F2 48 89 01 48 8B D9 F6 41" );
+	SDK_PATTERN( override_view, "client.dll:40 53 57 48 83 EC ?? 48 8B FA E8" );
+	SDK_PATTERN( parse_report_hit, "client.dll:48 89 5C 24 18 48 89 74 24 20 57 48 83 EC 20 48 8D 05 32 9F 59 01 8B F2 48 89 01 48 8B D9 F6 41" );
 	SDK_PATTERN( particle_create_effect, "client.dll:4C 8B DC 53 48 81 EC 90 00 00 00 F2 0F 10 05" );
 	SDK_PATTERN( particle_destroy_effect, "client.dll:83 FA FF 0F 84 ?? ?? ?? ?? 41 54" );
 	SDK_PATTERN( particle_manager, "client.dll:48 8B 35 * ?? ?? ?? ?? 44 89 6C 24 ??" );
 	SDK_PATTERN( particle_set_control_point, "client.dll:48 83 EC 58 F3 41 0F 10 51 04 F3 41 0F 10 09 F3 41 0F 10 59 08" );
 	SDK_PATTERN( particle_set_entity_binding, "client.dll:41 54 41 55 41 57 48 81 EC 90 00 00 00 4D 8B F9" );
 	SDK_PATTERN( particle_set_transform, "client.dll:48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 48 83 EC 40 48 8B F9 49 8B E9" );
+	SDK_PATTERN( pawn_on_land, "client.dll:40 55 53 48 8D AC 24 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 48 8B D9 0F 29 B4 24 ?? ?? ?? ?? 48 8B 89 ?? ?? ?? ?? 0F 28 F1 48 85 C9" );
 	SDK_PATTERN( post_network_data_received, "client.dll:48 89 5C 24 10 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 00 FD FF FF 48 81 EC 00 04 00 00 4C 8B F1 48" );
 	SDK_PATTERN( prediction_controller, "client.dll:B9 FF FF FF FF E8 ?? ?? ?? ?? 48 89 3D * ?? ?? ?? ?? 48 8B 5C 24 30 48 83 C4 20 5F C3" );
 	SDK_PATTERN( prediction_finish_move, "client.dll:48 8B C4 53 56 41 55 48 81 EC E0 00 00 00 44 0F 29 40 A8 45 33 ED 49 8B F0" );
@@ -94,7 +95,7 @@ namespace patterns {
 	SDK_PATTERN( render_view, "client.dll:4C 8B DC 53 55 57 41 55 48 81 EC D8 00 00 00 48 8D 05 ?? ?? ?? ?? 48 C7 44 24 48 ?? ?? ?? ??" );
 	SDK_PATTERN( serialize_move_crc, "client.dll:48 89 5C 24 ?? 55 56 57 48 83 EC 30 49 8B C0 48 8B FA 48 8B F1 48 8B 09 F6 C1 03" );
 	SDK_PATTERN( set_bodygroup, "client.dll:85 D2 0F 88 ?? ?? ?? ?? 55 56 57" );
-	SDK_PATTERN( set_player_model, "client.dll:48 8D 15 ?? ?? ?? ?? 48 8B CB > E8 ?? ?? ?? ?? 48 8B D7 48 8B CB" );
+	SDK_PATTERN( set_player_model, "client.dll:40 53 48 83 EC ?? 48 8B D9 4C 8B C2 48 8B 0D ?? ?? ?? ?? 48 8D 54 24" );
 	SDK_PATTERN( set_shader_param, "client.dll:BA 7C B0 CA 2A 48 8B CB 66 0F 7F 44 24 30 > E8 ?? ?? ?? ?? F3 0F 10 47 6C 4C 8D 44 24 30 0F C6 C0 00 BA 00 51 8B B0" );
 	SDK_PATTERN( set_shader_param_i, "client.dll:48 89 6C 24 ?? 48 89 74 24 ?? 57 48 83 EC 20 66 0F 6E CA 41 8B F0" );
 	SDK_PATTERN( set_view_angles, "client.dll:85 D2 75 ?? 48 63 81" );
@@ -126,7 +127,7 @@ namespace patterns {
 	SDK_PATTERN( weapon_update_skin, "client.dll:40 55 56 41 57 48 8D 6C 24 ?? 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 44 0F B6 FA 48 8B F1 80 78 58 00" );
 
 	// engine2.dll
-	SDK_PATTERN( engine_client_cmd, "engine2.dll:48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 57 41 56 41 57 48 81 EC 70 01 00 00 0F 29 70 D8 41 0F B6 E9 8D 42 FC 4D 8B F8 8B FA 4C 8B F1 83 F8 01 76 ?? 48 8B 1D ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ??" );
+	SDK_PATTERN( engine_client_cmd, "engine2.dll:48 8B C4 48 89 58 ?? 48 89 68 ?? 48 89 70 ?? 57 41 56 41 57 48 81 EC ?? ?? ?? ?? 0F 29 70 ?? 41 0F B6 E9" );
 	SDK_PATTERN( frame_input_ring_base, "engine2.dll:48 8D 05 * ?? ?? ?? ?? 0F 10 04 C8" );
 	SDK_PATTERN( frame_input_ring_idx, "engine2.dll:48 63 15 * ?? ?? ?? ?? 83 FA 0A 7D 61" );
 	SDK_PATTERN( get_net_channel, "engine2.dll:4C 8B 05 ?? ?? ?? ?? 4D 85 C0 74 10" );
@@ -151,15 +152,15 @@ namespace patterns {
 
 	// scenesystem.dll
 	SDK_PATTERN( draw_scene_object, "scenesystem.dll:48 8D 05 * ?? ?? ?? ?? 48 89 07 48 8B 7C 24 48 +8 ~" );
-	SDK_PATTERN( draw_scene_object_array, "scenesystem.dll:48 8B C4 48 89 50 ?? 48 89 48 ?? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 0F 29 70 ??" );
+	SDK_PATTERN( draw_scene_object_array, "scenesystem.dll:48 8B C4 48 89 50 ?? 48 89 48 ?? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 ?? ?? ?? ?? 48 81 EC ?? ?? ?? ?? 0F 29 70" );
 	SDK_PATTERN( draw_skybox_array, "scenesystem.dll:45 85 C9 0F 8E ?? ?? ?? ?? 4C 8B DC" );
-	SDK_PATTERN( generate_primitives, "scenesystem.dll:48 8D 05 * ?? ?? ?? ?? 48 89 07 48 8B 7C 24 48 +20 ~" );
+	SDK_PATTERN( generate_primitives, "scenesystem.dll:48 8B C4 48 89 58 ?? 4C 89 40 ?? 48 89 50 ?? 48 89 48 ?? 55 56 57 41 54 41 55 41 56 41 57 48 8D A8" );
 	SDK_PATTERN( light_data_queue, "scenesystem.dll:48 8B 05 * ?? ?? ?? ?? 48 C1 E1 04 +8" );
 	SDK_PATTERN( light_scene_object, "scenesystem.dll:> E8 ?? ?? ?? ?? 44 0F 28 5C 24 60" );
 	SDK_PATTERN( sort_primitives, "scenesystem.dll:45 85 C9 0F 84 ?? ?? ?? ?? 55 56 57 48 83 EC 30" );
 
 	// soundsystem.dll
-	SDK_PATTERN( play_sound, "soundsystem.dll:4C 8B DC 55 41 55 41 56 41 57" );
+	SDK_PATTERN( play_sound, "soundsystem.dll:48 89 5C 24 ?? 48 89 74 24 ?? 48 89 7C 24 ?? 55 48 8D 6C 24 ?? 48 81 EC ?? ?? ?? ?? 33 F6 C7 45 ?? ?? ?? ?? ?? 4C 8B C1" );
 
 	// tier0.dll
 	SDK_PATTERN( kv3_alloc, "tier0.dll:40 53 48 83 EC 30 80 FA 06 0F B6 C2 41 B9 16" );

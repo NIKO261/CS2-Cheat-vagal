@@ -10,8 +10,8 @@ namespace rendering {
 
 		std::string search_buf{};
 		std::vector<std::wstring> config_list{};
-		auto selected{ -1 };
-		auto needs_refresh{ true };
+		int selected{ -1 };
+		bool needs_refresh{ true };
 		auto confirm_delete{ false };
 		auto confirm_reset{ false };
 		auto confirm_timer{ 0.0f };

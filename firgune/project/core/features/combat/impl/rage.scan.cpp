@@ -58,28 +58,37 @@ namespace features::combat {
 		}
 	}
 
+	rage::scan_config rage::make_scan_config( const settings::combat::ragebot::weapon_group& config ) const
+	{
+		scan_config out{};
+		out.hitbox_count = build_hitbox_order( config, out.hitbox_order );
+		for ( auto i = 0; i < 6; ++i ) out.multipoints[ static_cast<std::size_t>( i ) ] = config.multipoints.values[ static_cast<std::size_t>( i ) ];
+		out.pointscale = config.pointscale.value;
+		out.max_fov = config.max_fov.value;
+		out.dynamic_pointscale = config.dynamic_pointscale.value;
+		out.debug_points = config.debug_multipoints.value;
+		return out;
+	}
+
 	std::vector<rage::candidate> rage::gather_candidates( const systems::local::snapshot& local, float max_distance_sq ) const
 	{
 		const auto players = systems::g_entities.get_by_type( systems::entities::type::player );
 		const auto origin = systems::g_prediction.pre( ).origin;
 		auto* self = const_cast< rage* >( this );
 		self->m_scan_records.clear( );
-		self->m_scan_records.reserve( players.size( ) * k_max_scan_records + 1 );
+		self->m_scan_records.reserve( players.size( ) * k_max_scan_records );
 
 		std::vector<candidate> result{};
 		result.reserve( players.size( ) );
+		std::vector<std::size_t> starts{};
+		starts.reserve( players.size( ) );
+
 		const auto weapon_type = g_shared.ctx( ).weapon_type;
 		const auto is_gun = weapon_type >= cstypes::weapon_type::pistol && weapon_type <= cstypes::weapon_type::lmg;
 		const auto& weapon_config = settings::g_combat.m_ragebot.get_group( weapon_type );
 		const auto precision = is_gun && settings::g_combat.m_ragebot.precision.value && !weapon_config.no_spread.value;
 		const auto precision_performance = precision && settings::g_combat.m_ragebot.precision_mode.value
 			== settings::combat::ragebot::precision_mode::performance;
-		const auto append_record = [ & ]( candidate& out, shared::lagcomp::record&& record )
-		{
-			if ( out.record_count >= k_max_scan_records || !record.valid ) return;
-			self->m_scan_records.push_back( std::move( record ) );
-			out.records[ out.record_count++ ] = &self->m_scan_records.back( );
-		};
 
 		for ( const auto& controller : players )
 		{
@@ -125,19 +134,38 @@ namespace features::combat {
 				if ( nearest > max_distance_sq ) continue;
 			}
 
+			// Copy every record first; the stable references are attached only
+			// after the collection loop so no container growth can invalidate a
+			// pointer while the scan snapshot is alive.
+			const auto start = self->m_scan_records.size( );
+			for ( auto i = 0; i < selected_count; ++i )
+			{
+				if ( selected[ i ].valid ) self->m_scan_records.push_back( std::move( selected[ i ] ) );
+			}
+			const auto record_count = self->m_scan_records.size( ) - start;
+			if ( record_count == 0 ) continue;
+
 			candidate out{};
 			out.pawn = pawn;
 			out.health = health;
 			out.armor = memory::read<int>( pawn + SCHEMA( "C_CSPlayerPawn", "m_ArmorValue"_hash ) );
-			if ( g_shared.ctx( ).weapon_type >= cstypes::weapon_type::pistol && g_shared.ctx( ).weapon_type <= cstypes::weapon_type::lmg )
+			if ( is_gun )
 			{
-				const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
+				const auto& config = settings::g_combat.m_ragebot.get_group( weapon_type );
 				out.min_damage = this->get_min_damage( config, health, config.min_damage_override.value );
 			}
+			out.record_count = static_cast<int>( record_count );
 			out.ordinal = result.size( );
-			for ( auto i = 0; i < selected_count; ++i ) append_record( out, std::move( selected[ i ] ) );
+			result.push_back( out );
+			starts.push_back( start );
+		}
 
-			if ( out.record_count > 0 ) result.push_back( out );
+		for ( std::size_t i = 0; i < result.size( ); ++i )
+		{
+			for ( auto r = 0; r < result[ i ].record_count; ++r )
+			{
+				result[ i ].records[ r ] = &self->m_scan_records[ starts[ i ] + static_cast<std::size_t>( r ) ];
+			}
 		}
 
 		// Double tap kill efficiency: with a single visible target the pair
@@ -146,7 +174,7 @@ namespace features::combat {
 		// point. Multiple targets keep the per-bullet lethal floor.
 		if ( is_gun && this->m_double_tap.can_pair( ) && result.size( ) == 1 )
 		{
-			const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
+			const auto& config = settings::g_combat.m_ragebot.get_group( weapon_type );
 			if ( !config.min_damage_override.value && config.min_damage >= 101 )
 			{
 				auto& cand = result.front( );
@@ -157,54 +185,104 @@ namespace features::combat {
 		return result;
 	}
 
-	std::vector<rage::scan_hit> rage::scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local ) const
+	void rage::prepare_scan_targets( std::vector<candidate>& candidates )
 	{
-		std::vector<std::vector<scan_hit>> slots( candidates.size( ) );
+		std::size_t total{};
+		for ( const auto& cand : candidates ) total += static_cast<std::size_t>( cand.record_count );
+
+		this->m_prepared_records.clear( );
+		if ( total == 0 ) return;
+		// Exact size first: no reallocation may move a prepared record while the
+		// scan (or a late re-scan of the same command) still references it.
+		this->m_prepared_records.resize( total );
+
+		std::size_t next{};
+		for ( auto& cand : candidates )
+		{
+			const auto first = next;
+			for ( auto r = 0; r < cand.record_count; ++r )
+			{
+				auto& prepared = this->m_prepared_records[ next++ ];
+				prepared.record = cand.records[ r ];
+				prepared.ordinal = static_cast<std::uint8_t>( r );
+				prepared.hitboxes = {};
+				if ( prepared.record )
+				{
+					prepared.penetration = g_shared.pen( ).prepare_target( cand.pawn, prepared.record );
+					for ( const auto& hitbox : prepared.penetration.hitboxes )
+					{
+						if ( hitbox.index >= 0 && hitbox.index < static_cast<int>( prepared.hitboxes.size( ) ) )
+						{
+							prepared.hitboxes[ static_cast<std::size_t>( hitbox.index ) ] = &hitbox;
+						}
+					}
+				}
+			}
+			for ( auto r = 0; r < cand.record_count; ++r ) cand.prepared[ r ] = &this->m_prepared_records[ first + static_cast<std::size_t>( r ) ];
+		}
+	}
+
+	void rage::scan_players( const math::vector3& eye, int eye_index, float inaccuracy, const aim_context& ctx, const scan_config& scan, std::vector<candidate>& candidates, const systems::local::snapshot& local, std::vector<scan_hit>& out, rage_stats* stats )
+	{
+		out.clear( );
+		if ( candidates.empty( ) ) return;
+
+		const auto collect = stats != nullptr && k_rage_diagnostics;
+		this->m_scan_slots.resize( candidates.size( ) );
+		this->m_debug_slots.resize( candidates.size( ) );
+		for ( auto& slot : this->m_scan_slots ) slot.clear( );
+		for ( auto& slot : this->m_debug_slots ) slot.clear( );
+		if ( collect ) this->m_scan_counters.resize( candidates.size( ) );
+
 		threadpool::parallel_for( 0, static_cast<int>( candidates.size( ) ), [ & ]( int begin, int end )
 		{
 			for ( auto i = begin; i < end; ++i )
 			{
-				auto& slot = slots[ static_cast<std::size_t>( i ) ];
-				for ( auto r = 0; r < candidates[ i ].record_count; ++r )
+				auto& cand = candidates[ static_cast<std::size_t>( i ) ];
+				auto& slot = this->m_scan_slots[ static_cast<std::size_t>( i ) ];
+				auto& debug = this->m_debug_slots[ static_cast<std::size_t>( i ) ];
+				auto* counters = collect ? &this->m_scan_counters[ static_cast<std::size_t>( i ) ] : nullptr;
+				if ( counters ) *counters = {};
+				for ( auto r = 0; r < cand.record_count; ++r )
 				{
-					if ( auto* record = candidates[ i ].records[ r ]; record && record->valid )
-					{
-						auto hits = scan_player( eye, inaccuracy, ctx, candidates[ i ], record, static_cast<std::uint8_t>( r ), local );
-						for ( auto& hit : hits ) slot.push_back( std::move( hit ) );
-					}
+					auto* prepared = cand.prepared[ r ];
+					if ( !prepared || !prepared->record || !prepared->record->valid ) continue;
+					this->scan_player( eye, eye_index, inaccuracy, ctx, scan, cand, *prepared, local, slot, counters, debug );
 				}
 			}
 		}, 1 );
 
-		std::size_t count = 0;
-		for ( const auto& slot : slots ) count += slot.size( );
-		std::vector<scan_hit> result{};
-		result.reserve( count );
-		for ( auto& slot : slots ) for ( auto& hit : slot ) result.push_back( std::move( hit ) );
-		return result;
+		// Deterministic merge: candidate order, then record order, then the
+		// point order produced by scan_player.
+		std::size_t total{};
+		for ( const auto& slot : this->m_scan_slots ) total += slot.size( );
+		out.reserve( total );
+		for ( auto& slot : this->m_scan_slots )
+		{
+			for ( const auto& hit : slot ) out.push_back( hit );
+		}
+
+		if ( collect )
+		{
+			for ( const auto& counter : this->m_scan_counters ) stats->add( counter );
+		}
+		if ( scan.debug_points )
+		{
+			std::lock_guard lock( this->m_debug_mtx );
+			for ( const auto& slot : this->m_debug_slots )
+			{
+				for ( const auto& point : slot ) this->m_debug_points.push_back( point );
+			}
+		}
 	}
 
-	std::vector<rage::scan_hit> rage::scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, const candidate& cand, shared::lagcomp::record* record, std::uint8_t record_ordinal, const systems::local::snapshot& local ) const
+	void rage::scan_player( const math::vector3& eye, int eye_index, float inaccuracy, const aim_context& ctx, const scan_config& scan, const candidate& cand, const prepared_record& prepared, const systems::local::snapshot& local, std::vector<scan_hit>& out, rage_stats::counters* counters, std::vector<debug_point>& debug ) const
 	{
-		if ( !cand.pawn || !record || !record->valid || cand.health <= 0 ) return {};
-		const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-		const auto scene = memory::read<std::uintptr_t>( cand.pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
-		if ( !scene ) return {};
-		const auto hitbox_set = systems::g_hitboxes.query( scene );
-		if ( hitbox_set.count <= 0 ) return {};
-		const auto skeleton = g_shared.lc( ).get_skeleton( *record );
-		const auto penetration = g_shared.pen( ).prepare_target( cand.pawn, record );
-
-		std::array<int, 19> order{};
-		const auto order_count = build_hitbox_order( config, order );
-
-		// Index the hitbox set once: the order loop below used a linear
-		// find_if per hitbox per record, which adds up with many players.
-		std::array<const systems::hitboxes::entry*, 19> indexed{};
-		for ( const auto& h : hitbox_set )
-		{
-			if ( h.index >= 0 && h.index < static_cast< int >( indexed.size( ) ) ) indexed[ h.index ] = &h;
-		}
+		if ( !cand.pawn || !prepared.record || !prepared.record->valid || cand.health <= 0 ) return;
+		const auto& penetration = prepared.penetration;
+		if ( !penetration.target_pawn ) return;
+		const auto bone_limit = std::min( prepared.record->bone_count, 27 );
+		if ( bone_limit <= 0 ) return;
 
 		struct point { math::vector3 position{}; systems::hitboxes::entry hitbox{}; int bone{}; bool center{}; };
 		std::array<point, 19 * 5> points{};
@@ -213,63 +291,63 @@ namespace features::combat {
 		{
 			if ( point_count < points.size( ) ) points[ point_count++ ] = value;
 		};
+
 		const auto group_for = []( int id )
 		{
 			if ( id == 0 ) return 0; if ( id >= 4 && id <= 6 ) return 1; if ( id == 2 || id == 3 ) return 2;
 			if ( id >= 13 && id <= 18 ) return 3; if ( id >= 7 && id <= 10 ) return 4; if ( id == 11 || id == 12 ) return 5; return -1;
 		};
-		const auto dynamic_pointscale = config.dynamic_pointscale.value;
-		const auto spread = g_shared.ctx( ).spread;
-		for ( auto i = 0; i < order_count; ++i )
+
+		for ( auto i = 0; i < scan.hitbox_count; ++i )
 		{
-			const auto id = order[ i ];
-			const auto hitbox = id >= 0 && id < static_cast< int >( indexed.size( ) ) ? indexed[ id ] : nullptr;
-			if ( hitbox == nullptr || hitbox->bone < 0 || hitbox->bone >= static_cast<int>( skeleton.size( ) ) ) continue;
-			const auto& bone = skeleton[ hitbox->bone ];
+			const auto id = scan.hitbox_order[ static_cast<std::size_t>( i ) ];
+			const auto* hitbox = id >= 0 && id < static_cast<int>( prepared.hitboxes.size( ) ) ? prepared.hitboxes[ static_cast<std::size_t>( id ) ] : nullptr;
+			if ( hitbox == nullptr || hitbox->bone < 0 || hitbox->bone >= bone_limit ) continue;
+			const auto& bone = prepared.record->bones[ hitbox->bone ];
 			if ( bone.position.length_sqr( ) < 1.0f ) continue;
 			const auto center = bone.rotation.rotate_vector( ( hitbox->mins + hitbox->maxs ) * 0.5f ) + bone.position;
 			append_point( { center, *hitbox, hitbox->bone, true } );
-			if ( config.debug_multipoints.value ) { std::lock_guard lock( m_debug_mtx ); m_debug_points.push_back( { center, id, true } ); }
+			if ( scan.debug_points ) debug.push_back( { center, id, true } );
+
 			const auto group = group_for( id );
-			if ( group >= 0 && config.pointscale > 0.0f && config.multipoints.values[ static_cast<std::size_t>( group ) ] )
+			if ( group >= 0 && scan.pointscale > 0.0f && scan.multipoints[ static_cast<std::size_t>( group ) ] )
 			{
 				// The unoccluded damage ceiling cannot prove that the center
 				// penetrates a wall. Keep enabled edge points; center_good below
 				// skips their traces only after an actual viable center trace.
-				for ( const auto& position : generate_multipoints( *hitbox, center, bone.rotation, config.pointscale, eye, inaccuracy, spread, dynamic_pointscale ) )
+				for ( const auto& position : generate_multipoints( *hitbox, center, bone.rotation, scan.pointscale, eye, inaccuracy, ctx.spread, scan.dynamic_pointscale ) )
 				{
 					append_point( { position, *hitbox, hitbox->bone, false } );
-					if ( config.debug_multipoints.value ) { std::lock_guard lock( m_debug_mtx ); m_debug_points.push_back( { position, id, false } ); }
+					if ( scan.debug_points ) debug.push_back( { position, id, false } );
 				}
 			}
 		}
+		if ( counters ) counters->points += static_cast<int>( point_count );
 
 		std::array<bool, 19> center_good{};
-		std::vector<scan_hit> result{};
-		result.reserve( point_count );
 		for ( auto point_index = std::size_t{}; point_index < point_count; ++point_index )
 		{
 			const auto& point = points[ point_index ];
-			if ( !point.center && point.hitbox.index >= 0 && point.hitbox.index < 19 && center_good[ point.hitbox.index ] ) continue;
+			if ( !point.center && point.hitbox.index >= 0 && point.hitbox.index < 19 && center_good[ static_cast<std::size_t>( point.hitbox.index ) ] ) continue;
 			const auto angle = math::helpers::calculate_angle( eye, point.position );
 			const auto fov = math::helpers::angle_distance( ctx.view_angles, angle );
-			if ( fov > config.max_fov ) continue;
+			if ( fov > scan.max_fov ) continue;
 			// The engine trace_bullet is the dominant per-point cost in the
 			// multipoint scan. Resolve the ray against the precomputed world
 			// hitboxes first and skip the trace when the resolved hitgroup
 			// cannot reach the damage floor - run() discards those points
 			// anyway, so the accepted hit set is unchanged.
 			if ( g_shared.pen( ).max_damage_for_ray( eye, point.position, penetration ) < cand.min_damage ) continue;
+			if ( counters ) ++counters->penetration_calls;
 			shared::penetration::result damage{};
 			if ( !g_shared.pen( ).run( eye, point.position, penetration, local.pawn, local.team, damage ) || damage.damage < cand.min_damage ) continue;
-			if ( point.center && point.hitbox.index >= 0 && point.hitbox.index < 19 ) center_good[ point.hitbox.index ] = !damage.penetrated || damage.damage >= static_cast<float>( cand.health );
+			if ( point.center && point.hitbox.index >= 0 && point.hitbox.index < 19 ) center_good[ static_cast<std::size_t>( point.hitbox.index ) ] = !damage.penetrated || damage.damage >= static_cast<float>( cand.health );
 			if ( !point.center && point.hitbox.index == 0 && damage.hitgroup != systems::g_hitboxes.hitgroup_from_hitbox( 0 ) ) continue;
-			result.push_back( scan_hit{ .position = point.position, .aim_angle = angle, .damage = damage.damage, .fov = fov,
+			out.push_back( scan_hit{ .position = point.position, .aim_angle = angle, .damage = damage.damage, .fov = fov,
 				.hitbox_index = point.hitbox.index, .hitgroup = damage.hitgroup, .bone_index = point.bone, .hitbox = point.hitbox,
-				.is_center = point.center, .penetrated = damage.penetrated, .pawn = cand.pawn, .health = cand.health, .record = record,
-				.candidate_ordinal = cand.ordinal, .record_ordinal = record_ordinal } );
+				.is_center = point.center, .penetrated = damage.penetrated, .pawn = cand.pawn, .health = cand.health, .record = prepared.record,
+				.candidate_ordinal = cand.ordinal, .record_ordinal = prepared.ordinal, .source_eye_index = eye_index, .point_ordinal = point_index } );
 		}
-		return result;
 	}
 
 	std::array<math::vector3, 4> rage::generate_multipoints( const systems::hitboxes::entry& hitbox, const math::vector3& center, const math::quaternion& rotation, float pointscale, const math::vector3& shoot_pos, float inaccuracy, float spread, bool dynamic_pointscale ) const
@@ -311,7 +389,7 @@ namespace features::combat {
 		};
 	}
 
-	bool rage::hittable_after_brake( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
+	bool rage::hittable_after_brake( const aim_context& ctx, const scan_config& scan, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
 	{
 		if ( !ctx.on_ground ) return false;
 		// Abs velocity, not networked: the networked copy trails ~2 ticks,
@@ -324,10 +402,10 @@ namespace features::combat {
 		if ( eye.length_sqr( ) < 1.0f ) eye = g_shared.get_eye_position( local.pawn );
 		if ( eye.length_sqr( ) < 1.0f ) return false;
 		eye += brake_displacement( velocity );
-		return this->any_damage_from_eye( eye, ctx, candidates, local );
+		return this->any_damage_from_eye( eye, ctx, scan, candidates, local );
 	}
 
-	bool rage::hittable_after_landing( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
+	bool rage::hittable_after_landing( const aim_context& ctx, const scan_config& scan, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const
 	{
 		if ( ctx.on_ground ) return false;
 		const auto landing = g_misc.autostop( ).predict_landing( local.pawn );
@@ -339,40 +417,31 @@ namespace features::combat {
 		const auto eye_offset = eye - systems::g_prediction.pre( ).origin;
 		auto settled = landing->origin + eye_offset;
 		settled += brake_displacement( systems::g_prediction.pre( ).velocity );
-		return this->any_damage_from_eye( settled, ctx, candidates, local );
+		return this->any_damage_from_eye( settled, ctx, scan, candidates, local );
 	}
 
-	bool rage::any_damage_from_eye( const math::vector3& eye, const aim_context& ctx, const std::vector<candidate>& candidates, const systems::local::snapshot& local ) const
+	bool rage::any_damage_from_eye( const math::vector3& eye, const aim_context& ctx, const scan_config& scan, const std::vector<candidate>& candidates, const systems::local::snapshot& local ) const
 	{
-		const auto& config = settings::g_combat.m_ragebot.get_group( g_shared.ctx( ).weapon_type );
-		std::array<int, 19> order{};
-		const auto order_count = build_hitbox_order( config, order );
 		for ( const auto& candidate : candidates )
 		{
-			const auto scene = memory::read<std::uintptr_t>( candidate.pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
-			if ( !scene ) continue;
-			const auto hitbox_set = systems::g_hitboxes.query( scene );
-			if ( hitbox_set.count <= 0 ) continue;
-			std::array<const systems::hitboxes::entry*, 19> indexed{};
-			for ( const auto& h : hitbox_set )
-			{
-				if ( h.index >= 0 && h.index < static_cast< int >( indexed.size( ) ) ) indexed[ h.index ] = &h;
-			}
 			for ( auto r = 0; r < candidate.record_count; ++r )
 			{
-				auto* record = candidate.records[ r ];
-				if ( !record || !record->valid ) continue;
-				const auto skeleton = g_shared.lc( ).get_skeleton( *record );
-				const auto penetration = g_shared.pen( ).prepare_target( candidate.pawn, record );
-				for ( auto i = 0; i < order_count; ++i )
+				auto* prepared = candidate.prepared[ r ];
+				if ( !prepared || !prepared->record || !prepared->record->valid ) continue;
+				const auto& penetration = prepared->penetration;
+				if ( !penetration.target_pawn ) continue;
+				const auto bone_limit = std::min( prepared->record->bone_count, 27 );
+				if ( bone_limit <= 0 ) continue;
+				for ( auto i = 0; i < scan.hitbox_count; ++i )
 				{
-					const auto hitbox = order[ i ] >= 0 && order[ i ] < static_cast< int >( indexed.size( ) ) ? indexed[ order[ i ] ] : nullptr;
-					if ( hitbox == nullptr || hitbox->bone < 0 || hitbox->bone >= static_cast< int >( skeleton.size( ) ) ) continue;
-					const auto& bone = skeleton[ hitbox->bone ];
+					const auto id = scan.hitbox_order[ static_cast<std::size_t>( i ) ];
+					const auto* hitbox = id >= 0 && id < static_cast<int>( prepared->hitboxes.size( ) ) ? prepared->hitboxes[ static_cast<std::size_t>( id ) ] : nullptr;
+					if ( hitbox == nullptr || hitbox->bone < 0 || hitbox->bone >= bone_limit ) continue;
+					const auto& bone = prepared->record->bones[ hitbox->bone ];
 					if ( bone.position.length_sqr( ) < 1.0f ) continue;
 					const auto center = bone.rotation.rotate_vector( ( hitbox->mins + hitbox->maxs ) * 0.5f ) + bone.position;
 					const auto angle = math::helpers::calculate_angle( eye, center );
-					if ( math::helpers::angle_distance( ctx.view_angles, angle ) > config.max_fov ) continue;
+					if ( math::helpers::angle_distance( ctx.view_angles, angle ) > scan.max_fov ) continue;
 					if ( g_shared.pen( ).max_damage_for_ray( eye, center, penetration ) < candidate.min_damage ) continue;
 					shared::penetration::result damage{};
 					if ( !g_shared.pen( ).run( eye, center, penetration, local.pawn, local.team, damage ) ) continue;

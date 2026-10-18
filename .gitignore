@@ -1,17 +1,46 @@
-/*
-!/.gitignore
-!/firgune.slnx
-!/firgune/
-/firgune/*
-!/firgune/firgune.vcxproj
-!/firgune/project/
-/firgune/project/**/*
-!/firgune/project/**/
-!/firgune/project/**/*.cpp
-!/firgune/project/**/*.hpp
-!/firgune/project/**/*.h
-!/firgune/project/**/*.c
-!/firgune/project/**/*.inl
-!/firgune/project/**/*.asm
-!/firgune/project/**/*.lib
-!/firgune/project/**/*.png
+# Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.sdf
+*.opensdf
+*.ipch
+*.tlog
+*.log
+*.obj
+*.pdb
+*.ilk
+*.pch
+*.idb
+*.exp
+*.lib
+*.dll
+*.exe
+*.dmp
+Debug/
+Release/
+x64/
+x86/
+ARM64/
+intermediates/
+
+# Build output
+bin/
+
+# Vendored link libraries (must be tracked)
+!firgune/project/external/luajit/*.lib
+
+# vcpkg
+vcpkg_installed/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor
+*.swp
+*.bak
+*.tmp

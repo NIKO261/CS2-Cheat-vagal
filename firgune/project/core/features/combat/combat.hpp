@@ -4,6 +4,117 @@
 
 namespace features::combat {
 
+	// Per-command ragebot diagnostics. Disabled by default: flip this constant,
+	// rebuild Development|x64 and the aggregate is written to vagal_init.log.
+	// It adds no menu item, config key or Lua surface, and compiles out when off.
+	inline constexpr bool k_rage_diagnostics{ false };
+
+	// Why a shot was released. Selection keeps the measured threshold result
+	// separate; the stop/fire path owns this reason.
+	enum class fire_reason : std::uint8_t
+	{
+		none,
+		hitchance,
+		force,
+		double_tap,
+		no_spread
+	};
+
+	// Aggregated over a bounded histogram instead of keeping per-command history.
+	// Workers touch only their own counter slot; the caller merges in a fixed
+	// order after the parallel scan finishes.
+	struct rage_stats
+	{
+		enum class no_fire_reason : std::uint8_t
+		{
+			none,
+			disabled,
+			no_candidates,
+			no_hits,
+			no_best,
+			cooldown,
+			prediction_failed,
+			not_settled,
+			low_hitchance,
+			visual_only,
+			scope,
+			submit_failed
+		};
+
+		struct counters
+		{
+			int enemies{};
+			int records{};
+			int eyes{};
+			int points{};
+			int penetration_calls{};
+			int hitchance_points{};
+			int hitchance_samples{};
+		};
+
+		struct timings
+		{
+			std::uint64_t prediction_ns{};
+			std::uint64_t prepare_ns{};
+			std::uint64_t scan_ns{};
+			std::uint64_t hitchance_ns{};
+			std::uint64_t select_ns{};
+			std::uint64_t total_ns{};
+		};
+
+		void begin( int command_number );
+		void finish( );
+		void submit( fire_reason reason );
+		void set_mode( std::uint32_t mode ) noexcept { this->m_mode = mode; }
+		void set_config_hash( std::uint32_t hash ) noexcept { this->m_config_hash = hash; }
+		void repredicted( ) noexcept { ++this->m_brake_repredictions; }
+		void rescanned( ) noexcept { ++this->m_rescans; }
+		void set_reason( no_fire_reason reason ) noexcept { this->m_reason = reason; }
+
+		[[nodiscard]] counters& work( ) noexcept { return this->m_work; }
+		[[nodiscard]] timings& time( ) noexcept { return this->m_time; }
+		void add( const counters& other ) noexcept;
+
+	private:
+		int m_command{ -1 };
+		std::uint32_t m_mode{};
+		std::uint32_t m_config_hash{};
+		counters m_work{};
+		timings m_time{};
+		int m_brake_repredictions{};
+		int m_rescans{};
+		no_fire_reason m_reason{ no_fire_reason::none };
+		fire_reason m_fire_reason{ fire_reason::none };
+		bool m_submitted{};
+		std::uint64_t m_start_ns{};
+	};
+
+	inline std::uint64_t steady_now_ns( )
+	{
+		return static_cast<std::uint64_t>( std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now( ).time_since_epoch( ) ).count( ) );
+	}
+
+	// Adds the elapsed time to one phase bucket; elided when diagnostics are off.
+	class stats_timer
+	{
+	public:
+		explicit stats_timer( std::uint64_t& target ) : m_target( target )
+		{
+			if constexpr ( k_rage_diagnostics ) this->m_start = steady_now_ns( );
+		}
+		~stats_timer( )
+		{
+			if constexpr ( k_rage_diagnostics ) this->m_target += steady_now_ns( ) - this->m_start;
+		}
+		stats_timer( const stats_timer& ) = delete;
+		stats_timer& operator=( const stats_timer& ) = delete;
+
+	private:
+		std::uint64_t& m_target;
+		std::uint64_t m_start{};
+	};
+
 	enum class autostop_mode : std::uint8_t
 	{
 		none,
@@ -277,6 +388,43 @@ namespace features::combat {
 		[[nodiscard]] shot_spread_state capture_shot_spread_state( ) const;
 		[[nodiscard]] math::vector2 calculate_spread( std::uint32_t seed, float accuracy, float spread, float recoil_index, int item_def_idx, int num_bullets, int weapon_mode = 0 ) const;
 		[[nodiscard]] math::vector3 get_aim_punch( std::uintptr_t local_pawn ) const;
+		// Incremental hit-chance evaluation. `planned` fixes the sample budget for
+		// one point in one spread context; extending it only appends samples, so
+		// the coarse ordering pass can be reused by the full verification.
+		struct hitchance_result
+		{
+			int hits{};
+			int evaluated{};
+			int planned{};
+			bool complete{};
+
+			[[nodiscard]] float value( ) const noexcept
+			{
+				return this->planned > 0 ? static_cast<float>( this->hits ) / static_cast<float>( this->planned ) : 0.0f;
+			}
+			// All remaining samples missing/hit. These are hard bounds: a point
+			// whose upper bound cannot reach the threshold is a definite failure.
+			[[nodiscard]] float lower_bound( ) const noexcept { return this->value( ); }
+			[[nodiscard]] float upper_bound( ) const noexcept
+			{
+				return this->planned > 0
+					? static_cast<float>( this->hits + ( this->planned - this->evaluated ) ) / static_cast<float>( this->planned )
+					: 0.0f;
+			}
+			[[nodiscard]] bool reaches( int percent ) const noexcept
+			{
+				return this->planned > 0 && this->hits * 100 >= percent * this->planned;
+			}
+			[[nodiscard]] bool can_reach( int percent ) const noexcept
+			{
+				return this->planned > 0 &&
+					( this->hits + ( this->planned - this->evaluated ) ) * 100 >= percent * this->planned;
+			}
+		};
+
+		// Extends `result` to `target_samples`, evaluating only the missing suffix.
+		// The per-thread spread table is reused for every point in the same context.
+		void advance_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, hitchance_result& result, int target_samples ) const;
 		[[nodiscard]] float calculate_hitchance( const math::vector3& shoot_position, const math::vector3& aim_angle, const systems::hitboxes::entry& hitbox, const systems::bones::data& bone, float inaccuracy, float spread, int samples = 256 ) const;
 		[[nodiscard]] std::optional<math::vector3> find_spread_correction( const math::vector3& aim_angle, int tick, const math::vector3& punch, const shot_spread_state& state ) const;
 		[[nodiscard]] math::vector3 get_eye_position( std::uintptr_t local_pawn ) const;
@@ -366,10 +514,6 @@ namespace features::combat {
 		public:
 			void on_create_move( systems::input::usercmd* cmd );
 			void on_override_view( std::uintptr_t view_setup );
-
-		private:
-			bool m_was_active{};
-			bool m_fake_stand_active{};
 		};
 
 		class quickpeek
@@ -399,10 +543,8 @@ namespace features::combat {
 		{
 		public:
 			void on_create_move( systems::input::usercmd* cmd );
-			// early-stop 结算对齐入口：settle 预测（build_context 的 simulate）
-			// 跑在本模块写入 counter 之前，模拟里只有玩家原始输入。刹车进行中
-			// 时由 rage 先行注入本 tick 的 counter，让开火门禁评估真实刹停后
-			// 状态；on_create_move 随后写的是同一份输入，幂等。
+			// Shared input writer for this command's ground prediction, the air
+			// pre-pass and final execution. All three use the same live velocity.
 			void write_brake_input( systems::input::usercmd* cmd, autostop_mode mode );
 			[[nodiscard]] bool request_landing( systems::input::usercmd* cmd, const systems::local::snapshot& local );
 			[[nodiscard]] std::optional<autostop_landing_prediction> predict_landing( std::uintptr_t pawn );
@@ -441,20 +583,14 @@ namespace features::combat {
 		[[nodiscard]] bool is_no_spread_state_prediction( ) const noexcept { return this->m_no_spread_state_prediction; }
 		[[nodiscard]] bool is_cocking_revolver( ) const noexcept { return this->m_revolver_cock_ticks > 0; }
 		[[nodiscard]] bool should_release_duck_for_shot( ) const noexcept { return this->m_release_duck_for_shot; }
-		[[nodiscard]] bool duckpeek_wants_reduck( ) const noexcept { return this->m_duckpeek_reduck; }
 		[[nodiscard]] bool landing_stop_active( ) const noexcept { return this->m_landing_stop_active; }
-		void clear_duckpeek_reduck( ) noexcept { this->m_duckpeek_reduck = false; }
 
 		static constexpr auto k_max_lagcomp_records{ 16 };
 		static constexpr auto k_max_scan_records{ 5 };
-		static constexpr auto k_settle_ticks_required{ 2 };
 
-		// Double tap (v3): the ragebot still creates a normal shot intent, but
-		// the actual DT wire pulse is committed at the end of create_move.
-		// This keeps later movement/Lua stages from deleting the attack edges.
-		// A successful first pulse arms one follow-up; the follow-up may bypass
-		// only the local cooldown and uses the weapon's live next-primary-attack
-		// claim on the next command. No cycle-time prediction is used.
+		// The first shot keeps fire_gun's ordinary attack history. Only a later
+		// command, after live ammo/cooldown advance, may submit the DT follow-up.
+		// Rebuilding either command must not count as another discharged bullet.
 		class double_tap
 		{
 		public:
@@ -481,24 +617,30 @@ namespace features::combat {
 			[[nodiscard]] charge_state state( ) const noexcept { return this->m_state; }
 			[[nodiscard]] float progress( ) const noexcept { return this->m_progress; }
 			[[nodiscard]] fail_reason last_fail( ) const noexcept { return this->m_fail_reason; }
-			[[nodiscard]] bool second_pending( ) const noexcept { return this->m_phase == pair_phase::second_queued; }
+			[[nodiscard]] bool second_pending( ) const noexcept
+			{
+				return ( this->m_phase == pair_phase::second_queued && this->m_command > this->m_first_command )
+					|| ( this->m_phase == pair_phase::second_submitted && this->m_command == this->m_second_command );
+			}
 			[[nodiscard]] bool second_ready( ) const noexcept
 			{
-				return this->second_pending( ) && this->m_claim_valid;
+				return this->second_pending( ) && this->m_claim_valid && this->m_first_observed;
 			}
-			[[nodiscard]] bool bypass_cooldown( ) const noexcept { return this->second_pending( ); }
-			[[nodiscard]] int attack_claim_tick( ) const noexcept { return this->can_pair( ) ? this->m_claim_tick : -1; }
+			[[nodiscard]] bool bypass_cooldown( ) const noexcept { return this->second_ready( ); }
+			[[nodiscard]] int attack_claim_tick( ) const noexcept { return this->second_ready( ) ? this->m_claim_tick : -1; }
 			[[nodiscard]] bool can_pair( ) const noexcept
 			{
 				return this->m_supported && this->m_claim_valid &&
-					( this->second_pending( ) || ( this->m_natural_ready && this->m_clip >= 2 ) );
+					( this->second_ready( ) || ( this->m_phase == pair_phase::idle && this->m_natural_ready && this->m_clip >= 2 )
+						|| ( this->m_phase == pair_phase::second_queued && this->m_command == this->m_first_command ) );
 			}
 
 		private:
 			enum class pair_phase : std::uint8_t
 			{
 				idle,
-				second_queued
+				second_queued,
+				second_submitted
 			};
 
 			void reset( ) noexcept;
@@ -509,16 +651,22 @@ namespace features::combat {
 			fail_reason m_fail_reason{ fail_reason::none };
 			pair_phase m_phase{ pair_phase::idle };
 			std::uintptr_t m_weapon{};
+			std::intptr_t m_command{ -1 };
+			std::intptr_t m_first_command{ -1 };
+			std::intptr_t m_second_command{ -1 };
 			std::intptr_t m_intent_command{ -1 };
 			int m_tick_base{ -1 };
 			int m_claim_tick{ -1 };
 			int m_first_claim_tick{ -1 };
+			int m_second_claim_tick{ -1 };
+			int m_first_clip{};
 			int m_pair_deadline{ -1 };
 			int m_cycle_ticks{ 1 };
 			int m_clip{};
 			bool m_supported{};
 			bool m_claim_valid{};
 			bool m_natural_ready{};
+			bool m_first_observed{};
 			bool m_intent{};
 			bool m_intent_is_second{};
 			float m_progress{};
@@ -541,6 +689,38 @@ namespace features::combat {
 			bool on_ground{};
 			bool is_scoped{};
 			bool prediction_valid{};
+			bool physically_settled{};
+		};
+
+		struct debug_point
+		{
+			math::vector3 position{};
+			int hitbox_index{};
+			bool is_center{};
+		};
+
+		// Read-only command snapshot built on the main thread. Workers read it
+		// and never touch settings or target state again.
+		struct scan_config
+		{
+			std::array<int, 19> hitbox_order{};
+			std::array<bool, 6> multipoints{};
+			int hitbox_count{};
+			float pointscale{};
+			float max_fov{};
+			bool dynamic_pointscale{};
+			bool debug_points{};
+		};
+
+		// View-independent part of one historical record: hitbox set plus the
+		// world-space capsule/box geometry. Identical for every eye of the same
+		// command, so it is derived once instead of once per viewpoint.
+		struct prepared_record
+		{
+			shared::lagcomp::record* record{};
+			shared::penetration::run_context penetration{};
+			std::array<const systems::hitboxes::entry*, 19> hitboxes{};
+			std::uint8_t ordinal{};
 		};
 
 		struct candidate
@@ -550,6 +730,7 @@ namespace features::combat {
 			int armor{};
 			float min_damage{};
 			std::array<shared::lagcomp::record*, k_max_scan_records> records{};
+			std::array<prepared_record*, k_max_scan_records> prepared{};
 			int record_count{};
 			std::size_t ordinal{};
 		};
@@ -575,6 +756,8 @@ namespace features::combat {
 			shared::lagcomp::record* record{};
 			std::size_t candidate_ordinal{};
 			std::uint8_t record_ordinal{};
+			int source_eye_index{};
+			std::size_t point_ordinal{};
 		};
 
 		struct target
@@ -582,7 +765,10 @@ namespace features::combat {
 			scan_hit hit{};
 			float hitchance{};
 			float expected_damage{};
+			// Measured threshold result only. Force/DT/exemption decisions live in
+			// fire_reason and the stop decision, never in this flag.
 			bool passes_hitchance{};
+			fire_reason reason{ fire_reason::none };
 			bool valid{};
 
 			[[nodiscard]] bool is_lethal( ) const noexcept
@@ -608,12 +794,13 @@ namespace features::combat {
 		};
 
 		[[nodiscard]] aim_context build_context( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const;
-		[[nodiscard]] bool weapon_ready_to_fire( ) const;
-		[[nodiscard]] bool should_brake_early( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
-		[[nodiscard]] bool hittable_after_brake( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
-		[[nodiscard]] bool hittable_after_landing( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
-		[[nodiscard]] bool any_damage_from_eye( const math::vector3& eye, const aim_context& ctx, const std::vector<candidate>& candidates, const systems::local::snapshot& local ) const;
-		[[nodiscard]] bool duckpeek_stand_viable( const aim_context& ctx, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
+		[[nodiscard]] bool weapon_ready_to_fire( systems::input::usercmd* cmd, const systems::local::snapshot& local ) const;
+		[[nodiscard]] scan_config make_scan_config( const settings::combat::ragebot::weapon_group& config ) const;
+		void prepare_scan_targets( std::vector<candidate>& candidates );
+		[[nodiscard]] bool hittable_after_brake( const aim_context& ctx, const scan_config& scan, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
+		[[nodiscard]] bool hittable_after_landing( const aim_context& ctx, const scan_config& scan, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
+		[[nodiscard]] bool any_damage_from_eye( const math::vector3& eye, const aim_context& ctx, const scan_config& scan, const std::vector<candidate>& candidates, const systems::local::snapshot& local ) const;
+		[[nodiscard]] bool duckpeek_stand_viable( const aim_context& ctx, const scan_config& scan, const systems::local::snapshot& local, const std::vector<candidate>& candidates ) const;
 		[[nodiscard]] std::vector<candidate> gather_candidates( const systems::local::snapshot& local, float max_distance_sq = 0.0f ) const;
 		[[nodiscard]] shared::shoot_history::eye_candidates resolve_eye_candidates( ) const;
 
@@ -623,12 +810,14 @@ namespace features::combat {
 		void auto_revolver( systems::input::usercmd* cmd, const aim_context& ctx, const systems::local::snapshot& local );
 		[[nodiscard]] bool revolver_ready_to_fire( const systems::input::usercmd* cmd ) const;
 
-		[[nodiscard]] std::vector<scan_hit> scan_players( const math::vector3& eye, float inaccuracy, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local ) const;
-		[[nodiscard]] std::vector<scan_hit> scan_player( const math::vector3& eye, float inaccuracy, const aim_context& ctx, const candidate& cand, shared::lagcomp::record* record, std::uint8_t record_ordinal, const systems::local::snapshot& local ) const;
-		[[nodiscard]] target select_best( const aim_context& aim_ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy ) const;
-		[[nodiscard]] float evaluate_hitchance( const scan_hit& hit, const aim_context& ctx, float inaccuracy, int samples = 512 ) const;
+		void scan_players( const math::vector3& eye, int eye_index, float inaccuracy, const aim_context& ctx, const scan_config& scan, std::vector<candidate>& candidates, const systems::local::snapshot& local, std::vector<scan_hit>& out, rage_stats* stats );
+		void scan_player( const math::vector3& eye, int eye_index, float inaccuracy, const aim_context& ctx, const scan_config& scan, const candidate& cand, const prepared_record& prepared, const systems::local::snapshot& local, std::vector<scan_hit>& out, rage_stats::counters* counters, std::vector<debug_point>& debug ) const;
+		[[nodiscard]] target select_best( const aim_context& aim_ctx, const std::vector<scan_hit>& hits, float eval_inaccuracy, rage_stats* stats ) const;
+		void advance_hitchance( const scan_hit& hit, const aim_context& ctx, float inaccuracy, shared::hitchance_result& result, int target_samples ) const;
+		[[nodiscard]] bool cannot_precede( const scan_hit& hit, const shared::hitchance_result& chance, const target& incumbent, int required_percent ) const;
 		[[nodiscard]] bool target_precedes( const target& lhs, const target& rhs ) const;
-		[[nodiscard]] stop_decision decide_stop( systems::input::usercmd* cmd, const aim_context& ctx, const target& best, std::vector<candidate>& candidates, const systems::local::snapshot& local, bool allow_fire, bool landing_pending ) const;
+		[[nodiscard]] float required_hitchance( const settings::combat::ragebot::weapon_group& config ) const;
+		[[nodiscard]] stop_decision decide_stop( systems::input::usercmd* cmd, const aim_context& ctx, const scan_config& scan, const target& best, std::vector<candidate>& candidates, const systems::local::snapshot& local, bool allow_fire, bool landing_pending ) const;
 
 		[[nodiscard]] std::vector<scan_hit> scan_taser( const math::vector3& eye, const aim_context& ctx, std::vector<candidate>& candidates, const systems::local::snapshot& local ) const;
 		[[nodiscard]] bool is_physically_settled( const aim_context& ctx ) const;
@@ -693,7 +882,6 @@ namespace features::combat {
 		bool m_landing_stop_active{};
 		bool m_firing_this_tick{};
 		bool m_release_duck_for_shot{};
-		bool m_duckpeek_reduck{};
 		bool m_no_spread_state_pending{};
 		bool m_no_spread_state_prediction{};
 		no_spread_accuracy_shadow m_no_spread_accuracy{};
@@ -705,17 +893,18 @@ namespace features::combat {
 		bool m_zeus_fired{};
 
 		int m_revolver_cock_ticks{};
-		mutable int m_settle_ticks{};
 		std::atomic<penetration_crosshair_state> m_penetration_crosshair_state{ penetration_crosshair_state::unavailable };
 
+		// Per-command scratch. Capacity is kept between commands; contents are
+		// rebuilt before the scan and stay immutable while workers run.
 		std::vector<shared::lagcomp::record> m_scan_records{};
-
-		struct debug_point
-		{
-			math::vector3 position{};
-			int hitbox_index{};
-			bool is_center{};
-		};
+		std::vector<prepared_record> m_prepared_records{};
+		std::vector<std::vector<scan_hit>> m_scan_slots{};
+		std::vector<std::vector<debug_point>> m_debug_slots{};
+		std::vector<rage_stats::counters> m_scan_counters{};
+		std::vector<scan_hit> m_scan_hits{};
+		std::vector<scan_hit> m_view_hits{};
+		rage_stats m_stats{};
 
 		mutable std::vector<debug_point> m_debug_points{};
 		mutable std::mutex m_debug_mtx{};

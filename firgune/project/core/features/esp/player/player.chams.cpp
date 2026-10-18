@@ -115,18 +115,16 @@ namespace features::esp::player {
 				if ( bt_scene_object )
 				{
 					const auto before = detail::read_primitive_buffer( primitive_buffer );
-					const auto prev_count = before ? before->count() : -1;
 
 					apply_config( chams_cfg.backtrack, bt_scene_object, true );
 
 					const auto after = detail::read_primitive_buffer( primitive_buffer );
-					const auto new_count = after ? after->count() : -1;
-					if ( after && prev_count >= 0 && new_count > prev_count )
+					if ( before && after )
 					{
-						for ( auto i = prev_count; i < new_count; ++i )
+						after->for_each_added( *before, []( std::uintptr_t primitive )
 						{
-							detail::mark_primitive_last( after->at( i ) );
-						}
+							detail::mark_primitive_last( primitive );
+						} );
 					}
 				}
 			}
@@ -155,15 +153,14 @@ namespace features::esp::player {
 						faded_cfg.overlay.color.value = fade (faded_cfg.overlay.color.value);
 
 					const auto before = detail::read_primitive_buffer( primitive_buffer );
-					const auto prev_count = before ? before->count() : -1;
 
 					apply_config (faded_cfg, os_obj, true);
 
 					const auto after = detail::read_primitive_buffer( primitive_buffer );
-					const auto new_count = after ? after->count() : -1;
-					if ( after && prev_count >= 0 && new_count > prev_count ) {
-						for (auto i = prev_count; i < new_count; ++i)
-							detail::mark_primitive_last( after->at( i ) );
+					if ( before && after ) {
+						after->for_each_added( *before, []( std::uintptr_t primitive ) {
+							detail::mark_primitive_last( primitive );
+						} );
 					}
 				}
 			}
@@ -762,13 +759,11 @@ namespace features::esp::player {
 	void chams::apply_layer( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, const xdraw::color& color, settings::esp::cham_ids material_id )
 	{
 		const auto before = detail::read_primitive_buffer( primitive_buffer );
-		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
 		const auto after = detail::read_primitive_buffer( primitive_buffer );
-		const auto new_count = after ? after->count() : -1;
-		if ( !after || prev_count < 0 || prev_count >= new_count )
+		if ( !before || !after )
 		{
 			return;
 		}
@@ -779,10 +774,10 @@ namespace features::esp::player {
 			return;
 		}
 
-		for ( auto i = prev_count; i < new_count; ++i )
+		after->for_each_added( *before, [ & ]( std::uintptr_t primitive )
 		{
-			detail::replace_primitive( after->at( i ), material, color );
-		}
+			detail::replace_primitive( primitive, material, color );
+		} );
 	}
 
 	void chams::apply_overlay( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, const xdraw::color& color, settings::esp::cham_ids material_id )
@@ -794,21 +789,19 @@ namespace features::esp::player {
 		}
 
 		const auto before = detail::read_primitive_buffer( primitive_buffer );
-		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
 		const auto after = detail::read_primitive_buffer( primitive_buffer );
-		const auto new_count = after ? after->count() : -1;
-		if ( !after || prev_count < 0 || prev_count >= new_count )
+		if ( !before || !after )
 		{
 			return;
 		}
 
-		for ( auto i = prev_count; i < new_count; ++i )
+		after->for_each_added( *before, [ & ]( std::uintptr_t primitive )
 		{
-			detail::replace_primitive( after->at( i ), material, color );
-		}
+			detail::replace_primitive( primitive, material, color );
+		} );
 
 		this->add_overlay_material( material );
 	}
@@ -816,39 +809,36 @@ namespace features::esp::player {
 	void chams::apply_clone( std::uintptr_t primitive_buffer, void( __fastcall* original_fn )( std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t ), std::uintptr_t a1, std::uintptr_t scene_object, std::uintptr_t scene_view, systems::materials::clone_type type )
 	{
 		const auto before = detail::read_primitive_buffer( primitive_buffer );
-		const auto prev_count = before ? before->count() : -1;
 
 		original_fn( a1, scene_object, scene_view, primitive_buffer );
 
 		const auto after = detail::read_primitive_buffer( primitive_buffer );
-		const auto new_count = after ? after->count() : -1;
-		if ( !after || prev_count < 0 || prev_count >= new_count )
+		if ( !before || !after )
 		{
 			return;
 		}
 
-		for ( auto i = prev_count; i < new_count; ++i )
+		after->for_each_added( *before, [ & ]( std::uintptr_t primitive )
 		{
-			const auto primitive = after->at( i );
 			const auto orig_mat = memory::read<std::uintptr_t>(
 				primitive + detail::primitive_material_offset );
 
 			if ( !orig_mat )
 			{
-				continue;
+				return;
 			}
 
 			const auto clone = systems::materials::get_or_create_clone( orig_mat, type );
 			if ( !clone )
 			{
-				continue;
+				return;
 			}
 
 			memory::write<std::uintptr_t>(
 				primitive + detail::primitive_material_offset, clone );
 			memory::write<std::uintptr_t>(
 				primitive + detail::primitive_material_copy_offset, clone );
-		}
+		} );
 	}
 
 	void chams::add_overlay_material( std::uintptr_t mat )

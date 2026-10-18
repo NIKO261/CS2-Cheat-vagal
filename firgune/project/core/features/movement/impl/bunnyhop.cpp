@@ -65,8 +65,6 @@ namespace features::movement {
 			const auto old_land_frac = memory::read<float>( modern + layout.landed_frac );
 			const auto old_jump_tick = memory::read<int>( services + layout.jumped_tick );
 			const auto old_jump_frac = memory::read<float>( services + layout.jumped_frac );
-			const auto expected_tick = memory::read<int>(
-				local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) ) + 1;
 
 			// Match input::apply without computing CRC or changing attack/history.
 			const auto saved_buttons = *buttons;
@@ -88,11 +86,13 @@ namespace features::movement {
 					out.landing_speed = std::hypotf(
 						memory::read<float>( modern + layout.landed_x ),
 						memory::read<float>( modern + layout.landed_y ) );
-					out.landed = land_tick == expected_tick
+					// Native records use the movement clock, not controller TickBase + 1.
+					// Only a record changed inside this rolled-back trial is fresh.
+					out.landed = land_tick >= 0
 						&& ( land_tick != old_land_tick || out.landing_when != old_land_frac )
 						&& std::isfinite( out.landing_when )
 						&& out.landing_when >= 0.0f && out.landing_when < 1.0f;
-					out.jumped = jump_tick == expected_tick
+					out.jumped = jump_tick >= 0
 						&& ( jump_tick != old_jump_tick || out.jump_when != old_jump_frac )
 						&& std::isfinite( out.jump_when ) && out.jump_when >= 0.0f && out.jump_when < 1.0f
 						&& ( flags & cstypes::entity_flags::on_ground ) == 0
@@ -229,6 +229,8 @@ namespace features::movement {
 
 	void bhop::on_create_move( systems::input::usercmd* cmd )
 	{
+		this->m_suppressed_jump_command = nullptr;
+		this->m_suppressed_jump_number = -1;
 		this->m_prediction_command = -1;
 		this->m_prediction_pawn = 0;
 		this->m_prediction_pending = false;
@@ -251,6 +253,13 @@ namespace features::movement {
 			cmd->buttons.value_scroll &= ~k_jump;
 			return;
 		}
+		// Keep this command's original intent for Jumpbug without changing
+		// bhop's normal airborne clear or polling a second physical key source.
+		if ( cmd->buttons.value & k_jump )
+		{
+			this->m_suppressed_jump_command = cmd;
+			this->m_suppressed_jump_number = cmd->command_number;
+		}
 		cmd->buttons.value &= ~k_jump;
 		cmd->buttons.value_changed &= ~k_jump;
 		cmd->buttons.value_scroll &= ~k_jump;
@@ -258,19 +267,27 @@ namespace features::movement {
 		if ( !perfect || !legacy || legacy->get<bool>( )
 			|| !std::isfinite( pre.velocity.z ) || pre.velocity.z >= 0.0f ) return;
 
-		// Reserve only on a predicted landing command, not throughout the fall.
-		// This first probe is a capacity hint; final movement is probed again.
-		const auto landing = predict( cmd, local );
-		if ( !landing.valid || !landing.landed ) return;
+		// Reserve while descending; early input is not the final trajectory.
+		// Only finish_prediction may decide whether this command actually lands.
 		const auto base = cmd->csgo_user_cmd.mutable_base( );
 		const auto moves = base ? base->mutable_subtick_moves( ) : nullptr;
-		if ( !moves || ( moves->size( ) > 0 && !moves->m_rep ) ) return;
+		if ( !moves || moves->size( ) < 0 || moves->size( ) > k_max_steps - 3
+			|| ( moves->size( ) > 0 && !moves->m_rep ) ) return;
 		for ( int i = 0; i < moves->size( ); ++i )
 			if ( moves->mutable_at( i )->button( ) & k_jump ) return;
 		// Reserve capacity, not button events: landing trials run after final movement.
 		this->m_prediction_command = cmd->command_number;
 		this->m_prediction_pawn = local.pawn;
 		this->m_prediction_pending = true;
+	}
+
+	bool bhop::suppressed_jump( const systems::input::usercmd* cmd ) const
+	{
+		// Lua marks an explicit release in value_changed, even when bhop has
+		// already cleared the held bit. That later writer must still win.
+		return cmd && cmd == this->m_suppressed_jump_command
+			&& cmd->command_number == this->m_suppressed_jump_number
+			&& ( cmd->buttons.value_changed & k_jump ) == 0;
 	}
 
 	void bhop::finish_prediction( systems::input::usercmd* cmd )
